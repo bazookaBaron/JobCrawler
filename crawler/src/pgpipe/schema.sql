@@ -116,3 +116,12 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.crawl_run (
     postings_pruned   int,
     notes          text
 );
+
+-- --- API access -----------------------------------------------------
+-- The webapp reads this schema ONLY through its Express server, which uses
+-- the Supabase service_role key. Grant that role read-only access. (The
+-- browser never queries these tables directly, so anon/authenticated get
+-- nothing and no RLS is needed here.)
+GRANT USAGE ON SCHEMA {{SCHEMA}} TO service_role;
+GRANT SELECT ON ALL TABLES IN SCHEMA {{SCHEMA}} TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA {{SCHEMA}} GRANT SELECT ON TABLES TO service_role;
