@@ -1,0 +1,78 @@
+name: crawl-jobs
+
+# $0 compute: one scheduled GitHub Actions job. Single process, NO Redis, no
+# server. `jobs run` reclaims stale queue rows, enqueues every enabled board,
+# crawls them with an in-process politeness gate, upserts compact rows into the
+# dedicated `crawler` Postgres schema, then closes postings not seen for 3 days
+# and trims each company to its newest 400.
+#
+# CRON TUNING: every 6 hours is a starting point. Check the "crawl" step
+# duration against RUN_MINUTES / the job timeout. ~516 boards at concurrency 12
+# with ATS politeness (~0.6s per shared host) is roughly 5-12 min.
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: crawl-jobs
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+        working-directory: crawler
+    env:
+      # Repo -> Settings -> Secrets and variables -> Actions -> New repository secret
+      LOCAL_DATABASE_URL: ${{ secrets.LOCAL_DATABASE_URL }}   # Supabase Postgres URI
+      PGPIPE_SCHEMA: crawler
+      PGPIPE_CONCURRENCY: "12"
+      RUN_MINUTES: "20"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv + Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies (locked)
+        run: uv sync --frozen
+
+      - name: Apply schema (idempotent)
+        run: uv run --no-sync jobs migrate
+
+      - name: Sync curated companies + boards (CSV -> Postgres)
+        run: uv run --no-sync jobs sync | tee ../sync.json
+
+      - name: Crawl (bounded) + close stale (3d) + prune per-company cap (400)
+        run: |
+          set -euo pipefail
+          uv run --no-sync jobs run --minutes "${RUN_MINUTES}" | tee ../run.json
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## crawl-jobs"
+            echo
+            echo '### sync'
+            echo '```json'; cat ../sync.json 2>/dev/null || echo '{}'; echo '```'
+            echo '### run'
+            echo '```json'; cat ../run.json 2>/dev/null || echo '{}'; echo '```'
+            echo '### db stats'
+            echo '```json'
+            uv run --no-sync jobs stats 2>&1 || echo '{"stats":"unavailable"}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

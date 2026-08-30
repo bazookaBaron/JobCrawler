@@ -1,0 +1,34 @@
+--- C:/Users/debna/AppData/Local/Temp/jobseek-src/apps/crawler/src/config.py	2026-08-30 18:17:51.822377000 +0530
++++ crawler/src/config.py	2026-08-30 19:18:30.555076100 +0530
+@@ -47,14 +47,12 @@
+     # production. See ``src/shared/ssrf.py`` for the threat model.
+     internal_hosts_allow: str = ""
+ 
+-    # Redis (local instance, not Upstash)
+-    redis_url: str = "redis://localhost:6379/0"
+-    # The pool must cover all concurrent discovery claim loops plus Redis
+-    # work triggered by active tasks; otherwise ``claim_work`` can exhaust it
+-    # and raise ``MaxConnectionsError``. Production runs
+-    # DISCOVERY_CONCURRENCY=20; 60 leaves headroom for monitor work, lookups,
+-    # metrics, and bursts during reschedule.
+-    redis_max_connections: int = 60
++    # job-crawler fork: Redis removed. This build is a single-process cron
++    # (src/pgpipe/) that uses Postgres (crawl_queue) as the work queue and an
++    # in-process politeness gate instead of Redis. src/redis_queue.py,
++    # src/redis_capacity.py and src/workers/pipeline.py are now dead code and
++    # will raise if invoked. REDIS_URL / UPSTASH_REDIS_* env vars are gone.
++    redis_max_connections: int = 60  # unused; kept so dead modules still import
+     throttle_delay_default: float = 2.0
+     throttle_delay_ats: float = 0.5
+     # Shared upstream-host circuit breaker. Board and posting failures still
+@@ -126,9 +124,7 @@
+     # for the lifetime of the container. Set to 0 only for diagnostics.
+     browser_playwright_recycle_seconds: int = 6 * 60 * 60
+ 
+-    # Upstash (web app only, kept for backward compat)
+-    upstash_redis_rest_url: str = ""
+-    upstash_redis_rest_token: str = ""
++    # job-crawler fork: Upstash Redis removed (see note above).
+     log_level: str = "INFO"
+     worker_id_prefix: str = ""
+     crawler_max_concurrent: int = 20

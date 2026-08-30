@@ -1,0 +1,308 @@
+from __future__ import annotations
+
+import math
+from ipaddress import ip_address
+from urllib.parse import urlparse
+
+from pydantic import Field, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    # Retained only for direct transitional library calls. Production crawler
+    # commands and generated runtime environments never select this boundary.
+    database_url: str = ""
+    # Provider-neutral boundary for web-owned data (currently watchlists).
+    # This may point at Supabase Free without making it a crawler mirror.
+    web_database_url: str = ""
+    local_database_url: str = "postgresql://crawler:crawler@postgres:5432/crawler"
+
+    # Proxy provider — applies to hosts with ``"proxy": true`` in
+    # ``monitor_config`` / ``scraper_config`` (``data/boards.csv``). See
+    # ``src.shared.proxy`` for the provider implementation. Webshare's pool entries
+    # are per-proxy backbone URLs (p.webshare.io), so a request/redirect chain
+    # or browser launch can keep one exit even when Webshare replaces the
+    # underlying ISP addresses each month.
+    proxy_provider: str = "none"  # none | webshare
+    webshare_proxy_urls: list[str] = Field(default_factory=list)
+    # Local/operator diagnostic only. Deployment intentionally does not
+    # forward this value; it pins same-egress anti-bot A/B canaries.
+    webshare_proxy_canary_slot: int | None = None
+    # Migration-only direct/static fallback. Direct Webshare addresses become
+    # stale when recurring replacements run; prefer WEBSHARE_PROXY_URLS.
+    webshare_proxy_url: str = ""
+    # Operator-only Webshare control-plane credential. The production deploy
+    # deliberately does not forward this into crawler containers.
+    webshare_api_key: str = ""
+    # Operator-side source allowlist used by ``crawler proxy-audit``. Values
+    # are compared in memory and never emitted in the report.
+    webshare_expected_client_ips: list[str] = Field(default_factory=list)
+
+    # SSRF guard — comma-separated list of ``host`` or ``host:port``
+    # entries that bypass the private-IP rejection in
+    # ``src.shared.ssrf``. The deployment's Postgres / Redis / Typesense
+    # hosts are derived automatically from their ``*_URL`` / ``*_HOST``
+    # settings; this knob is for ad-hoc boards or test fixtures that
+    # legitimately point at an internal service. Leave empty in
+    # production. See ``src/shared/ssrf.py`` for the threat model.
+    internal_hosts_allow: str = ""
+
+    # job-crawler fork: Redis removed. This build is a single-process cron
+    # (src/pgpipe/) that uses Postgres (crawl_queue) as the work queue and an
+    # in-process politeness gate instead of Redis. src/redis_queue.py,
+    # src/redis_capacity.py and src/workers/pipeline.py are now dead code and
+    # will raise if invoked. REDIS_URL / UPSTASH_REDIS_* env vars are gone.
+    redis_max_connections: int = 60  # unused; kept so dead modules still import
+    throttle_delay_default: float = 2.0
+    throttle_delay_ats: float = 0.5
+    # Shared upstream-host circuit breaker. Board and posting failures still
+    # follow their durable Postgres retry ramps, while these Redis-backed
+    # settings stop sibling boards/postings from independently hammering the
+    # same failing origin.
+    host_circuit_failure_threshold: int = 3
+    host_circuit_failure_window_seconds: int = 600
+    host_circuit_open_seconds: int = 1800
+    host_circuit_probe_seconds: int = 600
+
+    # Inflight lease + reaper (#3159 / #3173). When ``claim_work``
+    # atomically pops a task off the per-domain ZSET it also records
+    # an inflight lease entry in ``inflight:<wtype>``. If the worker
+    # dies between claim and ``reschedule_task``/``complete_task`` the
+    # reaper sweeps expired leases back onto the per-domain queue so
+    # the task isn't permanently lost.
+    #
+    # ``inflight_lease_ttl_seconds`` is the initial budget per task.
+    # Long-running monitors/scrapes extend the lease by sending
+    # heartbeats every ``inflight_heartbeat_interval_seconds`` — pick
+    # a value smaller than the TTL so we have headroom on a slow tick.
+    # Default 600 / 120 mirrors the Postgres-side
+    # ``leased_until = now() + interval '10 minutes'`` budget used by
+    # the legacy batch path (``queries/monitor.py:28``,
+    # ``queries/scrape.py:81``).
+    inflight_lease_ttl_seconds: int = 600
+    inflight_heartbeat_interval_seconds: int = 120
+    # Reaper tick interval. The reaper is cheap (one Lua EVALSHA per
+    # tick per worker type, capped at ``reaper_batch_size`` entries),
+    # but running it too aggressively wastes Redis CPU when the
+    # inflight set is empty. 30s gives <30s reaper latency on a
+    # SIGKILL'd worker — within the deploy.sh restart window.
+    reaper_interval_seconds: int = 30
+    reaper_batch_size: int = 200
+    # Strikes before a task is dead-lettered. The reaper bumps a
+    # per-task counter every time it has to re-enqueue. A genuinely
+    # poison task (Playwright always segfaults, etc.) would otherwise
+    # loop the reaper forever — at >= ``reaper_max_strikes`` reaps,
+    # the entry is moved to ``deadletter:<wtype>`` for operator
+    # investigation instead. Default 5: deploy churn / OOM-once
+    # patterns won't trip it; persistent failure modes will.
+    reaper_max_strikes: int = 5
+
+    # Bounded graceful drain on SIGTERM/SIGINT (#3205). When
+    # ``shutdown_event`` is set, ``run_pipeline`` stops claiming new
+    # work (existing behaviour) and then waits up to this many seconds
+    # for in-flight monitor/scrape tasks to finish before cancelling
+    # them. Cancellation alone would lose work — but in combination
+    # with the inflight lease (#3259), the reaper re-enqueues anything
+    # that didn't complete in time. Default 30s exceeds the 99th
+    # percentile monitor latency for HTTP boards (~2-15s) and gives
+    # browser workers room to close Playwright cleanly. Streaming
+    # monitors that legitimately run >30s (rare, large boards) will be
+    # cancelled and recovered by the reaper from the inflight lease.
+    #
+    # NOTE: deploy.sh sends ``docker stop --time=N`` which translates
+    # to a SIGTERM grace of N seconds before SIGKILL. This setting
+    # must be strictly less than that value or the kernel will SIGKILL
+    # us mid-drain. We use 30s here against a 60s docker stop budget.
+    shutdown_grace_seconds: int = 30
+
+    # Browser workers keep one Playwright driver process per discovery
+    # coroutine. Those Node driver processes are intentionally reused between
+    # jobs, but production memory snapshots showed their aggregate cgroup
+    # footprint growing over a multi-day container lifetime until a Chromium
+    # child was OOM-killed (#5488). Recycle each driver between jobs after a
+    # bounded lifetime so driver/browser allocator fragmentation cannot grow
+    # for the lifetime of the container. Set to 0 only for diagnostics.
+    browser_playwright_recycle_seconds: int = 6 * 60 * 60
+
+    # job-crawler fork: Upstash Redis removed (see note above).
+    log_level: str = "INFO"
+    worker_id_prefix: str = ""
+    crawler_max_concurrent: int = 20
+    crawler_max_browser: int = 3  # separate cap for browser (Playwright) work
+    # PostgreSQL connection ownership and pool ceilings. Production assigns a
+    # distinct role and explicit min/max to every service in docker-compose;
+    # the small defaults keep operator/maintenance commands bounded even when
+    # they are launched outside Compose. See docs/22-postgresql-connections.md.
+    crawler_db_role: str = "oneoff"
+    crawler_db_pool_min: int = 0
+    crawler_db_pool_max: int = 4
+    crawler_db_pool_idle_seconds: float = 60.0
+    metrics_port: int = 9091
+    r2_max_connections: int = 60  # controls R2 HTTP client pool size
+
+    # Pipeline concurrency (per-instance)
+    discovery_concurrency: int = 20
+    monitor_concurrency: int = 5  # max concurrent monitors
+    raw_buffer_size: int = 10
+    done_buffer_size: int = 10
+    writeback_concurrency: int = 5
+    cpu_threads: int = 1
+    drain_producers: int = 2
+    drain_consumers: int = 30
+    drain_buffer_size: int = 200
+    drain_retry_base_seconds: float = 5.0
+    drain_retry_max_seconds: float = 900.0
+    # Periodic reaper for orphaned r2_uploaded=NULL rows (#3168). The
+    # startup reaper always runs once before producers; this sweep
+    # catches consumer crashes that happen later in the process
+    # lifetime. Default 300s (5 minutes).
+    drain_reaper_interval: int = 300
+
+    # Exporter
+    export_interval: int = 1
+    export_batch_limit: int = 2000
+    export_downstream_backoff_base_seconds: float = 5.0
+    export_downstream_backoff_max_seconds: float = 300.0
+    # Typesense (disabled when typesense_operations_key is empty). This is a
+    # generated, revocable key scoped to collections/documents/aliases plus
+    # read-only server metrics. The bootstrap key stays on the Typesense host.
+    typesense_host: str = ""
+    typesense_port: int = 8108
+    typesense_protocol: str = "http"
+    typesense_operations_key: str = ""
+    typesense_health_interval_seconds: float = 30.0
+
+    # Enrichment (disabled by default — empty provider means skip)
+    enrich_provider: str = ""
+    enrich_model: str = ""
+    enrich_api_key: str = ""
+    enrich_batch_size: int = 500
+    enrich_min_batch_size: int = 10
+    enrich_max_wait_minutes: int = 60
+    enrich_poll_interval: int = 300
+    enrich_daily_spend_cap_usd: float = 5.0
+    enrich_input_price_per_m: float = 0.10
+    enrich_output_price_per_m: float = 0.40
+
+    # IndexNow (disabled when indexnow_key is empty). A single POST to
+    # api.indexnow.org propagates to Bing, Yandex, Seznam, Naver, and
+    # Microsoft Yep. Google does NOT participate in IndexNow.
+    # `indexnow_site_url` is the single source of truth — `indexnow_host`
+    # is derived from it on load unless explicitly overridden.
+    indexnow_key: str = ""  # 8-128 hex chars
+    indexnow_host: str = ""  # derived from site_url unless set
+    indexnow_site_url: str = ""  # e.g. "https://jseek.co" (no trailing slash)
+    indexnow_key_url: str = ""  # e.g. "https://jseek.co/indexnow-key.txt"
+    indexnow_interval: int = 3600  # seconds between ticks
+    # Per-tick submission cap. Avoids telling Bing/Yandex/Seznam/Naver/Yep
+    # to recrawl N×4 URLs in one blast — the resulting synchronized bot
+    # sweep hammers Vercel image transforms. Unsubmitted URLs stay
+    # hash-mismatched and return next tick. Set to 0 to disable the cap.
+    indexnow_max_urls_per_tick: int = 500
+
+    @model_validator(mode="after")
+    def _validate_proxy_settings(self) -> Settings:
+        self.proxy_provider = self.proxy_provider.strip().lower()
+        if self.proxy_provider not in {"none", "webshare"}:
+            raise ValueError("PROXY_PROVIDER must be one of: none, webshare")
+
+        if len(self.webshare_proxy_urls) > 64:
+            raise ValueError("WEBSHARE_PROXY_URLS must contain at most 64 entries")
+
+        normalized_urls: list[str] = []
+        for index, raw_url in enumerate(self.webshare_proxy_urls):
+            url = raw_url.strip()
+            try:
+                parsed = urlparse(url)
+                port = parsed.port
+            except ValueError as exc:
+                raise ValueError(f"WEBSHARE_PROXY_URLS entry {index} has an invalid port") from exc
+            if (
+                parsed.scheme not in {"http", "https", "socks5"}
+                or parsed.hostname != "p.webshare.io"
+                or port is None
+                or not parsed.username
+                or parsed.password is None
+                or parsed.query
+                or parsed.fragment
+                or parsed.path not in {"", "/"}
+            ):
+                raise ValueError(
+                    "WEBSHARE_PROXY_URLS entries must be credentialed "
+                    "p.webshare.io proxy URLs without path, query, or fragment"
+                )
+            normalized_urls.append(url.rstrip("/"))
+        if len(set(normalized_urls)) != len(normalized_urls):
+            raise ValueError("WEBSHARE_PROXY_URLS must not contain duplicate entries")
+        self.webshare_proxy_urls = normalized_urls
+
+        if self.webshare_proxy_canary_slot is not None:
+            available = len(normalized_urls) or (1 if self.webshare_proxy_url else 0)
+            if not 0 <= self.webshare_proxy_canary_slot < available:
+                raise ValueError("WEBSHARE_PROXY_CANARY_SLOT must select a configured proxy slot")
+
+        normalized_ips: list[str] = []
+        for raw_ip in self.webshare_expected_client_ips:
+            try:
+                normalized_ips.append(str(ip_address(raw_ip.strip())))
+            except ValueError as exc:
+                raise ValueError(
+                    "WEBSHARE_EXPECTED_CLIENT_IPS entries must be IPv4 or IPv6 addresses"
+                ) from exc
+        self.webshare_expected_client_ips = sorted(set(normalized_ips))
+        return self
+
+    @model_validator(mode="after")
+    def _validate_drain_retry_window(self) -> Settings:
+        if (
+            self.drain_retry_base_seconds <= 0
+            or self.drain_retry_max_seconds < self.drain_retry_base_seconds
+        ):
+            raise ValueError(
+                "DRAIN_RETRY_BASE_SECONDS must be positive and no greater than "
+                "DRAIN_RETRY_MAX_SECONDS"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_postgresql_pool(self) -> Settings:
+        if not self.crawler_db_role or any(
+            char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in self.crawler_db_role
+        ):
+            raise ValueError(
+                "CRAWLER_DB_ROLE must contain only lowercase letters, digits, and hyphens"
+            )
+        if len(self.crawler_db_role) > 40:
+            raise ValueError("CRAWLER_DB_ROLE must be at most 40 characters")
+        if self.crawler_db_pool_max < 1 or self.crawler_db_pool_max > 8:
+            raise ValueError("CRAWLER_DB_POOL_MAX must be between 1 and 8")
+        if self.crawler_db_pool_min < 0 or self.crawler_db_pool_min > self.crawler_db_pool_max:
+            raise ValueError(
+                "CRAWLER_DB_POOL_MIN must be non-negative and no greater than CRAWLER_DB_POOL_MAX"
+            )
+        if (
+            not math.isfinite(self.crawler_db_pool_idle_seconds)
+            or self.crawler_db_pool_idle_seconds <= 0
+            or self.crawler_db_pool_idle_seconds > 60
+        ):
+            raise ValueError(
+                "CRAWLER_DB_POOL_IDLE_SECONDS must be a finite positive value no greater than 60"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _normalize_indexnow(self) -> Settings:
+        # Strip trailing slashes on site_url to avoid double-slash URLs
+        # downstream ("https://jseek.co/" + "/en/..." → "...co//en/...").
+        if self.indexnow_site_url.endswith("/"):
+            self.indexnow_site_url = self.indexnow_site_url.rstrip("/")
+        # Derive host from site_url when unset. Explicit host wins so
+        # operators can still override, e.g. during cutover to www.
+        if not self.indexnow_host and self.indexnow_site_url:
+            self.indexnow_host = urlparse(self.indexnow_site_url).netloc
+        return self
+
+    model_config = SettingsConfigDict(env_file=(".env", ".env.local"), extra="ignore")
+
+
+settings = Settings()

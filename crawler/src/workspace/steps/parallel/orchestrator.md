@@ -1,0 +1,234 @@
+# Parallel Pipeline — {{ slug }}
+
+## Setup
+
+{% if not company_name %}
+Company details not yet configured. Start by setting name and website:
+
+```bash
+ws set {{ slug }} --name "..." --website "..." --no-discover
+```
+{% endif %}
+
+## Spawn parallel tracks
+
+Launch these as **background subagents** simultaneously. Pass each
+rendered prompt below as the subagent's task description — no file
+reads or variable substitution needed.
+
+Use the project custom agent assigned to each track so the bounded work runs
+on the intended model and reasoning level:
+
+- Track A: `jobseek-company-enricher`
+- Track B: `jobseek-logo-selector`
+- Track C: `jobseek-board-researcher`
+- Parallel config tests: `jobseek-config-tester`
+
+Tracks A and B are fire-and-forget — check results before submit.
+Track C yields boards progressively — start processing each board
+as it's added.
+
+> **Scope is global, not locale-specific.** The user's country in the
+> GitHub issue is where the request came from, **not a geographic filter**.
+> Configure ALL of the company's career boards worldwide — do not restrict
+> to a single country or region. Never add query parameters like
+> `?location=switzerland` or `?country=us` to board URLs. Use the
+> unfiltered base URL so the crawler captures all listings.
+
+{% if ats_inventory_seed %}
+{% if ats_inventory_seed.status == "pending" %}
+## Validate the preconfigured inventory board first
+
+The issue supplied a content-validated inventory seed. It is evidence, not a
+replacement for research:
+
+- Source key: `{{ ats_inventory_seed.source_key }}`
+- Board: `{{ ats_inventory_seed.board_url }}`
+- Native monitor: `{{ ats_inventory_seed.monitor_type }}`
+- Config name: `{{ ats_inventory_seed.config_name }}`
+
+While Tracks A-C run, test this preconfigured board immediately:
+
+```bash
+ws run monitor {{ slug }} --board {{ ats_inventory_seed.board_alias }} --config {{ ats_inventory_seed.config_name }}
+```
+
+Only a successful run with one or more live jobs validates the fast path and
+allows you to skip `ws probe monitor` for this config. Confirm from the live
+site that the tenant belongs to this company and compare its count with the
+published inventory estimate{% if ats_inventory_seed.published_active_jobs is not none %}
+({{ ats_inventory_seed.published_active_jobs }} jobs at issue creation){% endif %}.
+
+If the run fails, returns zero jobs, belongs to another company, or the URL is
+stale, run the normal probe and configuration flow for this board. Do not keep
+the seed merely because it came from inventory.
+{% elif ats_inventory_seed.status == "verified" %}
+## Inventory board already verified
+
+The native `{{ ats_inventory_seed.monitor_type }}` seed for
+`{{ ats_inventory_seed.board_url }}` already completed successfully with
+{{ ats_inventory_seed.jobs }} live job(s). Do not rerun the seed merely because
+`ws task` was rendered again. Continue with live-site count/identity checks,
+feedback, scraper quality, and the remaining workflow.
+{% else %}
+## Inventory fast path disabled — use normal discovery
+
+The inventory candidate for `{{ ats_inventory_seed.board_url }}` was not
+accepted (`{{ ats_inventory_seed.reason | default("validation failed", true) }}`).
+Do not rerun `inventory-seed`. Probe and configure the board through the normal
+workflow if independent company/board research still supports it.
+{% endif %}
+
+Regardless of the seed status, Track C must discover all official global,
+regional, subsidiary, and additional ATS boards, and every normal metadata,
+logo, feedback, comparison, CSV-validation, and PR gate remains mandatory.
+{% endif %}
+
+### Track A — Enrichment
+
+<track-a>
+{{ track_a_prompt }}
+</track-a>
+
+### Track B — Logos
+
+<track-b>
+{{ track_b_prompt }}
+</track-b>
+
+### Track C — Board Discovery
+
+<track-c>
+{{ track_c_prompt }}
+</track-c>
+
+## Process boards
+
+Use `ws await-board {{ slug }}` to block until Track C adds a board, then process
+it immediately. Repeat until no more boards arrive (timeout).
+
+`await-board` automatically tracks which boards it has already returned —
+no need to pass `--exclude` flags.
+
+```
+while ws await-board {{ slug }}; do
+    # await-board prints the new board alias
+    # Process it: probe, test configs, feedback
+done
+```
+
+For each new board:
+
+1. `ws await-board {{ slug }}` — blocks until a new board appears (auto-tracks seen boards)
+2. **Skip probing if ATS is already confirmed:** A validated inventory seed
+   counts as confirmed only after its monitor run succeeds with one or more
+   live jobs. If a previous board from this
+   company already identified a specific ATS (e.g., Greenhouse), and the new
+   board URL is on the same ATS domain, skip probing — directly select the same
+   monitor type with the board-specific token.
+   Otherwise: `ws probe monitor {{ slug }} -n <expected-job-count> --board <alias>`
+3. **Decide testing strategy based on probe results:**
+
+   For every URL-only monitor, run the selected monitor once and then run
+   `ws probe scraper {{ slug }} --board <alias>` before choosing scraper
+   candidates. This probe recognizes provider-specific detail scrapers such as
+   `onlyfy`; do not assume that a generic `dom` monitor also requires a generic
+   `dom` or `json-ld` scraper.
+
+   **Fast path (single test, no subagents):** If the probe's top result is a
+   **known stable ATS** — greenhouse, ashby, comeet, lever, gem, inploi, manatal,
+   seamlesshiring, recruitee, personio, prospective,
+   welcometothejungle,
+   workday, adp, avature, bamboohr, beisen, brassring, paycom, jazzhr, jobvite, pageup, icims, intervieweb, gupy, cornerstone, darwinbox, dayforce, herp, hrmos, recruiterbox, keka, taleo, typify, ukg, hirehive, hireology, turbohire, paylocity, pinpoint, dvinci, traffit, rss — AND it matched with
+   high confidence (detected via `can_handle`), test it directly yourself.
+   No need to spawn subagents for an obvious choice. For companies with
+   multiple boards on the same ATS, configure subsequent boards directly
+   without re-probing.
+
+   **Parallel path (2-3 subagents):** If the probe returns multiple plausible
+   options with similar scores, OR the top result is a generic type (sitemap,
+   dom, api_sniffer, nextdata), spawn parallel subagents to test each.
+   Use the `jobseek-config-tester` custom agent with the config-tester template
+   below — fill in the board-specific variables.
+   Use `--config <name>` flag on `ws run` to avoid active_config races.
+
+4. If parallel: collect results, compare using the criteria below.
+5. Pick the best config: `ws select config {{ slug }} <name> --board <alias>`
+6. **Before recording feedback**, check if "acceptable" can become "good":
+   - Absent fields available in JSON-LD? Switch scraper to `json-ld`.
+   - Noisy field values? Use the `map` spec to normalize (`ws help fields`).
+   - Monitor has titles but missing locations? Try `enrich` option.
+   - Scraper coverage < 100%? Tune `timeout`/`wait` before accepting.
+7. Record feedback: `ws feedback {{ slug }} --board <alias> ...`
+8. Loop back to step 1.
+
+When `ws await-board {{ slug }}` exits with code 1 (timeout or discovery complete),
+all boards are processed.
+
+### Config tester template
+
+Fill in the `{variables}` and pass to a `jobseek-config-tester` subagent.
+**Remind every subagent: do NOT read source code files (src/core/, src/shared/, any .py).
+Use only `ws` commands and `ws help`.**
+
+<config-tester-template>
+{{ config_tester_raw }}
+</config-tester-template>
+
+### Config comparison criteria
+
+{{ config_comparison_raw }}
+
+## Converge and submit
+
+Before submitting, verify:
+- All metadata fields set (descriptions x4, industry, logos)
+- All boards configured and feedback recorded
+- Job counts verified against website
+- **Multinational check:** If the company has 500+ employees or offices in
+  multiple countries but only 1 board was configured, discovery is likely
+  incomplete. Investigate the careers page for regional or ATS-specific
+  boards before submitting.
+- **Board overlap check (2+ boards):** Run `ws compare-boards {{ slug }}`
+  to detect mirrors, subsets, and partial overlaps. If boards are mirrors or
+  subsets, drop the redundant one (keep the board with better data quality,
+  or lower cost if equal). For partial overlaps, investigate whether both
+  boards serve distinct audiences before keeping both.
+
+```bash
+ws compare-boards {{ slug }}   # check for overlap between boards
+ws submit {{ slug }} [--summary "..."]
+```
+
+### Advance through final steps
+
+After submit succeeds, advance to the reflect step:
+
+```bash
+ws task next --notes "<difficulties, key decisions, or 'none'>"
+```
+
+During reflection, contribute to the knowledge base:
+
+- **Non-obvious problem solved?** Record it so future agents can find it:
+  `ws task learn --step <step> --symptom "..." --solution "..." --tags "..."`
+- **Complex board configuration?** Record a case study:
+  `ws task casestudy --company {{ slug }} --monitor <type> --scraper <type> --tags "..." --summary "..."`
+- Nothing noteworthy? Skip this — only record genuinely reusable lessons.
+
+Then complete the workflow:
+
+```bash
+ws task complete
+```
+
+**Do NOT call `ws task complete` directly after `ws submit`.** The sequence
+is: `ws submit` → `ws task next` (enters reflect) → `ws task complete`.
+
+## If something goes wrong
+
+- Subagent failed → investigate and re-run, or handle manually
+- No boards found → investigate the website directly
+- All configs failed for a board → try manually or `ws task fail --reason "..."`
+- New evidence invalidates earlier decisions → `ws task back --to <step> --reason "..."`
+- Edge cases → `ws task troubleshoot "<query>"`

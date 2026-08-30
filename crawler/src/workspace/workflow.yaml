@@ -1,0 +1,63 @@
+# Task-driven workflow definition.
+#
+# Step 00 (pre-verify) runs BEFORE the workspace exists — handled by
+# ``ws task --issue <N>`` directly, not by the workflow engine.
+#
+# Steps below are executed in order: global_steps → per_board_steps (looped
+# for each board) → final_steps.  Each step has a gate that must pass before
+# the workflow advances.
+#
+# Gate types:
+#   state   — verified automatically by checking workspace/board state
+#   manual  — agent confirms completion via ``ws task next``
+
+global_steps:
+  - id: setup
+    title: "Claim issue and configure company"
+    instructions: steps/01-setup.md
+    gate:
+      type: state
+
+  - id: add_boards
+    title: "Discover and add boards"
+    instructions: steps/02-add-boards.md
+    gate:
+      type: state
+      check: all_boards_added
+
+per_board_steps:
+  - id: select_monitor
+    title: "Select and test monitor"
+    instructions: steps/03-select-monitor.md
+    gate:
+      type: state
+      check: monitor_tested
+
+  - id: select_scraper
+    title: "Select and test scraper"
+    instructions: steps/04-select-scraper.md
+    skip_when: scraper_auto_configured
+    gate:
+      type: state
+      check: scraper_tested
+
+  - id: verify_and_feedback
+    title: "Verify quality and record feedback"
+    instructions: steps/05-verify-and-feedback.md
+    gate:
+      type: state
+      check: feedback_recorded
+
+final_steps:
+  - id: submit
+    title: "Submit"
+    instructions: steps/06-submit.md
+    gate:
+      type: state
+      check: submitted
+
+  - id: reflect
+    title: "Final reflection"
+    instructions: steps/07-reflect.md
+    gate:
+      type: manual

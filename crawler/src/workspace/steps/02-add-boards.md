@@ -1,0 +1,145 @@
+# Step: Discover and Add Boards
+
+Find all career page URLs for this company and register each as a board.
+
+Treat discovery output as signals, not directives. For each board candidate,
+capture:
+
+1. Observation (counts, links, references)
+2. How observed (homepage traversal, rendered page, probe)
+3. Likely meaning (primary board, stale board, or uncertain)
+
+## Verify listings exist
+
+The career page must show at least one job posting.
+**Count the total number of jobs displayed** — you will need this for `ws probe monitor -n <count>`.
+
+If the page is only a marketing/landing page with a "View jobs" link, do not use the
+landing URL as the board. Follow the link and use the actual listings URL (for example
+`jobs.lever.co/<company>` or `boards.greenhouse.io/<company>`).
+
+`ws add board` now checks outgoing links on the board URL and tries to infer a
+job-link pattern. A real board usually behaves like a **job link hub** (multiple
+job-detail links following a consistent pattern). If pattern inference fails, treat
+that as a strong signal that the URL may be a marketing page.
+
+`ws` discovery also stores traversal evidence under workspace state. Use this
+to distinguish directly referenced boards from blind guesses.
+
+If the page is JS-rendered and shows 0 listings, use the job count from web search results
+(e.g., LinkedIn, Glassdoor) as an approximation. If there are genuinely no open positions,
+reject with `ws reject --reason no-open-positions --message "..."`.
+Careers page behind auth → fail with `ws task fail --reason "Board requires auth — needs dedicated support"`. Do **not** reject — auth-gated boards are a technical limitation, not an invalid request.
+Small companies with 1–3 jobs are valid — proceed.
+
+Manual source inspection is optional in this phase; start with crawler evidence first.
+
+## Discover board URLs
+
+### Hreflang regional variants
+
+Career discovery extracts `<link rel="alternate" hreflang="...">` tags from page
+headers. These reveal regional career page variants. Interpret the results:
+
+- **Many career-path variants + distinct hosts** → separate regional boards are
+  needed (e.g. Accenture with 55 region-specific APIs)
+- **Many career-path variants + same host** → may be a centralized ATS (one
+  board) or separate regional data behind one domain (separate boards needed)
+  — probe one region to check
+- **Few or zero career-path variants** → ignore hreflang; use other discovery signals
+
+The discovery output shows an "Hreflang regional variants" summary with counts
+and a centralized-ATS warning when applicable.
+
+### Manual discovery
+
+Starting from the company's careers page, look for:
+- Language/region switcher (EN | DE | FR tabs)
+- Separate URLs per region (`/en/careers`, `/de/careers`, `/us/jobs`)
+- Multiple ATS boards (e.g., Greenhouse for engineering + Lever for sales)
+- "See jobs in [other country]" links
+
+The issue URL is a starting point, not a scope constraint.
+
+> **SCOPE IS GLOBAL — NOT LIMITED TO THE USER'S COUNTRY.**
+> The user's country in the issue is where the request came from, not a
+> geographic filter. Always use the company's full/global job board URL —
+> never restrict to a single country or region via query parameters
+> (e.g., `?location=switzerland`). If the board has a region picker, use
+> the unfiltered base URL so the crawler captures all listings. Adding
+> location filters is a common mistake — avoid it.
+
+**Note ALL distinct board URLs found.**
+Only add URLs that are actual listing boards (or listings feeds), not informational pages.
+
+**Tip — local/regional boards:** If you discover even one locale-specific or
+country-specific board (e.g., `/en-US/`, `/de/careers`, a separate Workday site
+per region), it is very likely there are many more. Enumerate all of them —
+check the region/language switcher, `robots.txt` sitemap entries, and hreflang
+tags exhaustively. Do not stop at the first local board you find.
+
+**Tip — population/function-specific boards:** The same applies to boards
+segmented by audience or job function (e.g., `graduates`, `internships`,
+`experienced`, `engineering`, `sales`). If you find one such board, check for
+all the others — companies that split by population or function almost always
+have several. Look at `robots.txt` sitemap entries, navigation links on the
+careers page, and Workday site lists for the full set.
+
+Prefer directly referenced board URLs over unreferenced slug guesses unless
+the latter has stronger corroborating evidence.
+
+**Centralized parent portals:** If the company's careers page redirects to a
+parent company's portal (e.g. SWISS → Lufthansa Group, Fiat → Stellantis),
+the parent company should be configured instead — reject this issue and create
+a workspace for the parent. Use `ws task fail --reason "Jobs are hosted on
+<Parent> Group's centralized portal at <URL>. Configure the parent company
+instead."` to abort.
+
+## Add each board
+
+```bash
+ws add board <alias> --url "<board-url>"
+ws add board <alias> --url "<board-url>" --job-link-pattern "<regex>"   # optional override
+```
+
+If auto-inference fails after adding, set the pattern manually:
+
+```bash
+ws set --board <alias> --job-link-pattern "<regex>"
+```
+
+## Pattern safety check (required when setting regex manually)
+
+If you set `--job-link-pattern` manually:
+
+1. Start broad enough to include URL variants (numeric suffixes, trailing slash, query params).
+   Prefer optional endings over exact-string matches.
+2. Re-run detection and compare against expected site count:
+   `ws probe monitor -n <count>` then `ws run monitor`
+3. If count drops after adding the pattern, the regex is too strict.
+   Widen it before moving to Step 3.
+4. Spot-check that each visible posting has a matching URL in monitor output (`jobs.json`).
+
+**Alias naming conventions:**
+- Single board: `careers`
+- Regional boards: `careers-us`, `careers-de`, `careers-eu`
+- Per-ATS boards: `careers-gh` (Greenhouse), `careers-lever`
+- Departmental: `careers-engineering`, `careers-sales`
+
+## Multiple boards
+
+```bash
+ws add board careers-us --url "https://company.com/us/careers"
+ws add board careers-de --url "https://company.com/de/careers"
+```
+
+After configuring monitors for all boards, run `ws compare-boards` to detect
+overlapping boards (mirrors, subsets, partial overlap). Drop redundant boards —
+keep the one with better data quality, or lower cost if equal. Document skipped
+boards in feedback `--verdict-notes`.
+
+## When done
+
+```bash
+ws task next --notes "<how many boards added, any that were skipped>"
+```

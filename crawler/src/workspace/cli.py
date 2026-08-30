@@ -1,0 +1,320 @@
+"""Click CLI entry point for the ``ws`` workspace tool."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import click
+
+from src.workspace import output as out
+from src.workspace.commands.config import (
+    add_board,
+    add_boards,
+    await_board,
+    boards_done,
+    del_board,
+    discover,
+    discover_bg,
+    logos,
+    set_,
+)
+from src.workspace.commands.crawl import (
+    compare_boards,
+    feedback_cmd,
+    probe_api,
+    probe_deep,
+    probe_monitors,
+    probe_scraper,
+    reject_config,
+    run_monitor,
+    run_scraper,
+    select_config,
+    select_monitor,
+    select_scraper,
+)
+from src.workspace.commands.help import help_cmd
+from src.workspace.commands.lifecycle import (
+    del_,
+    new,
+    reject,
+    resume,
+    search,
+    status,
+    submit,
+    use,
+    validate,
+)
+from src.workspace.commands.task import task
+from src.workspace.commands.taxonomy import taxonomy_group
+from src.workspace.errors import WorkspaceError
+
+# Common agent typos → resolved command name (must be a registered top-level command)
+_COMMAND_ALIASES: dict[str, str] = {
+    "show": "status",
+    "list": "status",
+    "remove": "del",
+    "rm": "del",
+    "switch": "use",
+}
+
+
+class _WsGroup(click.Group):
+    """Click group that silently resolves common aliases and suggests
+    corrections for unknown commands."""
+
+    def resolve_command(self, ctx: click.Context, args: list[str]) -> tuple:  # type: ignore[override]
+        # Silently resolve known aliases to the real command
+        if args and args[0] in _COMMAND_ALIASES:
+            args[0] = _COMMAND_ALIASES[args[0]]
+        try:
+            return super().resolve_command(ctx, args)
+        except click.UsageError:
+            raise
+
+
+def _resolve_ws_version() -> str:
+    """Resolve the ``ws`` version from whichever package is installed.
+
+    Two distributions can ship this CLI:
+
+    - ``jobseek-crawler-setup`` — the slim wheel published to PyPI that
+      installs ``ws`` for end users / agents.
+    - ``jobseek-crawler`` — the full crawler package, only ever installed
+      as an editable dev install from ``apps/crawler``.
+
+    Both share the same ``VERSION`` file, so either lookup is correct.
+    Click's ``version_option(package_name=...)`` only accepts a single
+    name and raises ``RuntimeError`` if that package isn't installed,
+    which broke ``ws --version`` from a clean slim install.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    for pkg in ("jobseek-crawler-setup", "jobseek-crawler"):
+        try:
+            return version(pkg)
+        except PackageNotFoundError:
+            continue
+    return "unknown"
+
+
+@click.group(cls=_WsGroup)
+@click.version_option(version=_resolve_ws_version())
+def ws():
+    """Workspace CLI for managing company additions."""
+
+
+# ── Top-level commands ──────────────────────────────────────────────────
+
+ws.add_command(new)
+ws.add_command(search)
+ws.add_command(await_board, name="await-board")
+ws.add_command(boards_done, name="boards-done")
+ws.add_command(use)
+ws.add_command(set_, name="set")
+ws.add_command(submit)
+ws.add_command(reject)
+ws.add_command(status)
+ws.add_command(validate)
+ws.add_command(resume)
+ws.add_command(help_cmd, name="help")
+ws.add_command(logos)
+ws.add_command(discover)
+ws.add_command(discover_bg, name="discover-bg")
+ws.add_command(compare_boards, name="compare-boards")
+ws.add_command(feedback_cmd, name="feedback")
+ws.add_command(reject_config, name="reject-config")
+ws.add_command(task, name="task")
+ws.add_command(taxonomy_group, name="taxonomy")
+
+
+# ── `ws add` group ──────────────────────────────────────────────────────
+
+
+@ws.group(name="add")
+def add_group():
+    """Add resources to a workspace."""
+
+
+add_group.add_command(add_board, name="board")
+add_group.add_command(add_boards, name="boards")
+
+
+# ── `ws probe` group ────────────────────────────────────────────────────
+
+
+@ws.group(name="probe")
+def probe_group():
+    """Probe monitor or scraper types for the active board."""
+
+
+probe_group.add_command(probe_monitors, name="monitor")
+probe_group.add_command(probe_scraper, name="scraper")
+probe_group.add_command(probe_deep, name="deep")
+probe_group.add_command(probe_api, name="api")
+
+
+# ── `ws del` group ──────────────────────────────────────────────────────
+
+
+class _DeleteGroup(click.Group):
+    """Delete group that supports `ws del board <alias>` shorthand.
+
+    Click normally parses `board` as the optional `[SLUG]` positional.
+    If that happens and the next token is not a known subcommand, reinterpret
+    it as the `board` subcommand argument.
+    """
+
+    def resolve_command(self, ctx, args):
+        slug = ctx.params.get("slug")
+        if slug == "board" and args:
+            cmd = self.get_command(ctx, "board")
+            if cmd is not None:
+                return "board", cmd, args
+        return super().resolve_command(ctx, args)
+
+
+@ws.group(
+    name="del",
+    cls=_DeleteGroup,
+    invoke_without_command=True,
+)
+@click.argument("slug", required=False)
+@click.pass_context
+def del_group(ctx, slug):
+    """Delete a workspace or its resources."""
+    if ctx.invoked_subcommand is None:
+        if slug == "board":
+            raise click.UsageError("Usage: ws del board <alias-or-board_slug>")
+        if slug is None:
+            from src.workspace.state import resolve_slug
+
+            slug = resolve_slug(None)
+        ctx.invoke(del_, slug=slug)
+
+
+del_group.add_command(del_board, name="board")
+
+
+# ── `ws select` group ──────────────────────────────────────────────────
+
+
+@ws.group(name="select")
+def select_group():
+    """Select monitor or scraper type."""
+
+
+select_group.add_command(select_monitor, name="monitor")
+select_group.add_command(select_scraper, name="scraper")
+select_group.add_command(select_config, name="config")
+
+
+# ── `ws run` group ─────────────────────────────────────────────────────
+
+
+@ws.group(name="run")
+def run_group():
+    """Run monitor or scraper tests."""
+
+
+run_group.add_command(run_monitor, name="monitor")
+run_group.add_command(run_scraper, name="scraper")
+
+
+def _detect_repo_root() -> Path | None:
+    """Detect the jobseek repo root in priority order.
+
+    1. ``WS_REPO_ROOT`` env var (explicit override)
+    2. CWD inside a git repo that contains ``apps/crawler/data/``
+    3. Managed clone at ``~/.jobseek/repo/``
+    """
+    # 1. Env var override
+    env = os.environ.get("WS_REPO_ROOT")
+    if env:
+        p = Path(env)
+        if (p / "apps" / "crawler" / "data").exists():
+            return p
+
+    # 2. CWD inside repo
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        root = Path(result.stdout.strip())
+        if (root / "apps" / "crawler" / "data").exists():
+            return root
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Fall back to the managed clone when git is unavailable or outside a repo.
+        pass
+
+    # 3. Managed clone
+    managed = Path.home() / ".jobseek" / "repo"
+    if (managed / "apps" / "crawler" / "data").exists():
+        return managed
+
+    return None
+
+
+def _pivot_to_worktree(command_args: list[str] | None = None) -> None:
+    """Authenticate and pivot to the active workspace's exact worktree.
+
+    Called after initial repo root detection so that .workspace/ state
+    is findable, then re-points repo_root to the worktree for CSV/git
+    operations.  This lets multiple agents work concurrently on
+    different workspaces without clashing.
+
+    Local mode never pivots. Non-local workspace metadata fails closed when
+    the persisted path/identity is absent, stale, or replaced.
+    """
+    from src.workspace.state import get_active_slug, load_workspace
+    from src.workspace.worktree_auth import pivot_to_authenticated_worktree
+
+    if os.environ.get("WS_LOCAL", "").strip() in ("1", "true", "yes"):
+        return
+
+    slug = get_active_slug()
+    if not slug:
+        return
+    try:
+        ws_obj = load_workspace(slug)
+    except FileNotFoundError:
+        return
+
+    from src.shared.constants import set_repo_root
+    from src.workspace.commands.lifecycle import authenticated_terminal_recovery_root
+
+    recovery_root = authenticated_terminal_recovery_root(ws_obj, command_args or [])
+    if recovery_root is not None:
+        set_repo_root(recovery_root)
+        return
+    pivot_to_authenticated_worktree(ws_obj)
+
+
+def main():
+    from src.shared.constants import set_repo_root
+
+    repo_root = _detect_repo_root()
+    if repo_root:
+        set_repo_root(repo_root)
+
+    # Late-init: pivot to the active workspace's worktree (if any)
+    _pivot_to_worktree(sys.argv[1:])
+
+    try:
+        ws(standalone_mode=False)
+    except click.exceptions.Exit:
+        # Click already handled normal command termination.
+        pass
+    except click.ClickException as e:
+        e.show()
+        sys.exit(e.exit_code)
+    except WorkspaceError as e:
+        out.die(str(e))
+    except KeyboardInterrupt:
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(130)

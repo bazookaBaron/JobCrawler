@@ -1,0 +1,548 @@
+"""Pure HTML → structured-data extraction engine.
+
+Flattens HTML into a list of contentful leaf elements, then walks
+extraction steps to pull out named fields.  No I/O, no dependencies
+beyond stdlib.
+"""
+
+from __future__ import annotations
+
+import re
+import warnings
+from datetime import datetime
+from html import escape
+from html.parser import HTMLParser
+
+# Tags that never contain visible job content
+SKIP_TAGS = frozenset(
+    {
+        "script",
+        "style",
+        "noscript",
+        "svg",
+        "path",
+        "meta",
+        "link",
+        "iframe",
+        "object",
+        "embed",
+        "head",
+        "template",
+    }
+)
+
+# Tags whose entire subtrees are structural noise. A semantic ``h1`` directly
+# inside a page header is captured separately; the rest of the header remains
+# excluded so global navigation and calls to action cannot leak into jobs.
+NOISE_TAGS = frozenset(
+    {
+        "nav",
+        "footer",
+        "header",
+    }
+)
+
+# Inline tags that don't constitute their own "block" — we fold their
+# text into the parent block element.
+INLINE_TAGS = frozenset(
+    {
+        "a",
+        "abbr",
+        "acronym",
+        "b",
+        "bdo",
+        "big",
+        "br",
+        "button",
+        "cite",
+        "code",
+        "dfn",
+        "em",
+        "i",
+        "img",
+        "input",
+        "kbd",
+        "label",
+        "map",
+        "mark",
+        "q",
+        "ruby",
+        "s",
+        "samp",
+        "select",
+        "small",
+        "span",
+        "strong",
+        "sub",
+        "sup",
+        "textarea",
+        "time",
+        "tt",
+        "u",
+        "var",
+        "wbr",
+    }
+)
+
+# Void elements that have no closing tag
+VOID_TAGS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
+
+
+class FlattenParser(HTMLParser):
+    """Parse HTML and emit flat contentful elements."""
+
+    def __init__(self, *, include_hidden: bool = False):
+        super().__init__()
+        self._include_hidden = include_hidden
+        self.elements: list[dict] = []
+        # Stack of (tag, attrs_dict, is_skipped)
+        self._stack: list[tuple[str, dict, bool]] = []
+        self._skip_depth = 0  # > 0 means we're inside a skipped subtree
+        self._current_text: list[str] = []
+        self._current_block_tag: str | None = None
+        self._current_block_attrs: dict = {}
+        self._block_depth = 0
+        # Special <title> capture — works even inside <head> (SKIP_TAGS)
+        self._in_title = False
+        self._title_text: list[str] = []
+        # Preserve a semantic page title inside an otherwise noisy <header>.
+        self._in_header_h1 = False
+        self._header_h1_attrs: dict = {}
+        self._header_h1_text: list[str] = []
+
+    @staticmethod
+    def _normalized_text(parts: list[str]) -> str:
+        return " ".join("".join(parts).split())
+
+    def _flush_header_h1(self) -> None:
+        text = self._normalized_text(self._header_h1_text)
+        if text:
+            self.elements.append({"tag": "h1", "attrs": self._header_h1_attrs, "text": text})
+        self._in_header_h1 = False
+        self._header_h1_attrs = {}
+        self._header_h1_text = []
+
+    def _flush_text(self):
+        """Flush accumulated text as an element."""
+        # Preserve the document's actual separation between inline nodes.
+        # Joining every text node with a synthetic space corrupts animated
+        # headings such as ``<span>S</span><span>a</span><span>l</span>``
+        # into ``S a l``.  Raw text nodes already contain the whitespace that
+        # separates words, so concatenate first and normalize afterwards.
+        text = self._normalized_text(self._current_text)
+        if text and len(text) > 0:
+            self.elements.append(
+                {
+                    "tag": self._current_block_tag or "?",
+                    "attrs": self._current_block_attrs,
+                    "text": text,
+                }
+            )
+        self._current_text = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]):
+        attr_dict = {k: v or "" for k, v in attrs}
+
+        # Special case: track <title> even inside skipped subtrees (e.g. <head>)
+        if tag == "title":
+            self._in_title = True
+
+        # Track skip depth
+        if self._skip_depth > 0:
+            skip_root = next((entry for entry in self._stack if entry[2]), None)
+            if (
+                tag == "h1"
+                and skip_root is not None
+                and skip_root[0] == "header"
+                and not any(entry[0] == "nav" for entry in self._stack)
+                and skip_root[1].get("aria-hidden") != "true"
+                and "hidden" not in skip_root[1]
+            ):
+                self._in_header_h1 = True
+                self._header_h1_attrs = attr_dict
+                self._header_h1_text = []
+            elif tag == "br" and self._in_header_h1:
+                self._header_h1_text.append(" ")
+            if tag not in VOID_TAGS:
+                self._stack.append((tag, attr_dict, True))
+                self._skip_depth += 1
+            return
+
+        if tag in SKIP_TAGS or tag in NOISE_TAGS:
+            if tag not in VOID_TAGS:
+                self._stack.append((tag, attr_dict, True))
+                self._skip_depth = 1
+            return
+
+        # Check for aria-hidden or hidden attribute
+        if not self._include_hidden and (
+            attr_dict.get("aria-hidden") == "true" or "hidden" in attr_dict
+        ):
+            if tag not in VOID_TAGS:
+                self._stack.append((tag, attr_dict, True))
+                self._skip_depth = 1
+            return
+
+        # A line break separates visible text even though it has no text node.
+        if tag == "br":
+            self._current_text.append(" ")
+
+        if tag not in VOID_TAGS:
+            self._stack.append((tag, attr_dict, False))
+
+        # If this is a block-level element, flush previous block and start new one
+        if tag not in INLINE_TAGS and tag not in VOID_TAGS:
+            self._flush_text()
+            self._current_block_tag = tag
+            self._current_block_attrs = attr_dict
+            self._block_depth = len(self._stack)
+
+    def handle_endtag(self, tag: str):
+        if tag == "title":
+            self._in_title = False
+        if tag == "h1" and self._in_header_h1:
+            self._flush_header_h1()
+
+        if tag in VOID_TAGS:
+            return
+
+        # Pop stack. HTMLParser does not imply optional end tags (for example,
+        # a new ``<li>`` does not close the previous one), so real-world
+        # minified HTML frequently reaches this branch with several open
+        # descendants. Keep ``_skip_depth`` in sync with every entry removed;
+        # otherwise one malformed list inside a skipped header/nav/footer can
+        # make the parser treat the rest of the document as noise.
+        popped: list[tuple[str, dict, bool]] = []
+        if self._stack and self._stack[-1][0] == tag:
+            popped.append(self._stack.pop())
+        elif self._stack:
+            # Mismatched tag — try to find it
+            for i in range(len(self._stack) - 1, -1, -1):
+                if self._stack[i][0] == tag:
+                    popped.extend(self._stack[i:])
+                    del self._stack[i:]
+                    break
+
+        skipped_popped = sum(1 for _, _, was_skipped in popped if was_skipped)
+        if skipped_popped:
+            self._skip_depth = max(0, self._skip_depth - skipped_popped)
+            return
+
+        if self._skip_depth > 0:
+            return
+
+        # If closing a block-level element, flush
+        if tag not in INLINE_TAGS:
+            self._flush_text()
+            # Restore parent block context
+            for s_tag, s_attrs, s_skip in reversed(self._stack):
+                if not s_skip and s_tag not in INLINE_TAGS:
+                    self._current_block_tag = s_tag
+                    self._current_block_attrs = s_attrs
+                    break
+            else:
+                self._current_block_tag = None
+                self._current_block_attrs = {}
+
+    def handle_data(self, data: str):
+        # Capture <title> text even inside skipped subtrees
+        if self._in_title:
+            self._title_text.append(data)
+        if self._in_header_h1:
+            self._header_h1_text.append(data)
+        if self._skip_depth > 0:
+            return
+        self._current_text.append(data)
+
+    def finish(self):
+        self._flush_text()
+        if self._in_header_h1:
+            self._flush_header_h1()
+        # Prepend <title> element if captured (even from inside <head>)
+        if self._title_text:
+            title_text = self._normalized_text(self._title_text)
+            if title_text:
+                self.elements.insert(
+                    0,
+                    {
+                        "tag": "title",
+                        "attrs": {},
+                        "text": title_text,
+                    },
+                )
+
+
+def flatten(html: str, *, include_hidden: bool = False) -> list[dict]:
+    """Return flat list of contentful elements from HTML."""
+    parser = FlattenParser(include_hidden=include_hidden)
+    parser.feed(html)
+    parser.finish()
+    return parser.elements
+
+
+_UNICODE_PUNCT = str.maketrans(
+    {
+        "\u2018": "'",  # left single quote
+        "\u2019": "'",  # right single quote
+        "\u201c": '"',  # left double quote
+        "\u201d": '"',  # right double quote
+        "\u2013": "-",  # en dash
+        "\u2014": "-",  # em dash
+        "\u00a0": " ",  # non-breaking space
+        "\u200b": "",  # zero-width space
+        "\u200c": "",  # zero-width non-joiner
+        "\u200d": "",  # zero-width joiner
+        "\ufeff": "",  # BOM / zero-width no-break space
+    }
+)
+
+
+def _norm(s: str) -> str:
+    """Normalize Unicode punctuation to ASCII for matching."""
+    return s.translate(_UNICODE_PUNCT).lower()
+
+
+def _join_html(collected: list[dict]) -> str:
+    """Join collected elements into an HTML string, preserving tag structure.
+
+    Consecutive ``li`` elements are grouped inside ``<ul>`` tags.
+    """
+    parts: list[str] = []
+    in_list = False
+    for el in collected:
+        tag = el["tag"]
+        text = escape(el["text"])
+        if tag == "li":
+            if not in_list:
+                parts.append("<ul>")
+                in_list = True
+            parts.append(f"<li>{text}</li>")
+        else:
+            if in_list:
+                parts.append("</ul>")
+                in_list = False
+            parts.append(f"<{tag}>{text}</{tag}>")
+    if in_list:
+        parts.append("</ul>")
+    return "".join(parts)
+
+
+def _normalize_input_date(value: str, date_input_format: object) -> str:
+    """Parse an explicitly configured source date format to ISO 8601."""
+    if (
+        not isinstance(date_input_format, str)
+        or not date_input_format
+        or len(date_input_format) > 64
+    ):
+        raise ValueError("step date_input_format must be a non-empty bounded string")
+    try:
+        return datetime.strptime(value, date_input_format).date().isoformat()
+    except ValueError as exc:
+        raise ValueError(
+            f"step value {value!r} does not match date_input_format {date_input_format!r}"
+        ) from exc
+
+
+def walk_steps(
+    elements: list[dict],
+    steps: list[dict],
+    *,
+    start: int = 0,
+) -> tuple[dict[str, str | list[str] | None], int]:
+    """Walk flat elements according to extraction steps, returning extracted fields.
+
+    Every step with a ``field`` key is guaranteed present in the result: the
+    extracted value when found, ``None`` when not found.
+
+    Parameters
+    ----------
+    start : int
+        Initial cursor position.  Used by the DOM scraper to begin
+        extraction at the element matching a URL fragment (anchor).
+
+    Supported step keys:
+        tag        — match by element tag name
+        text       — match by substring in element text
+        attr       — match by HTML attribute ("key=substring" or "key")
+        match_regex — require a regex match against the element text
+        field      — output field name (omit for anchor-only steps)
+        offset     — skip N elements after match before extracting (default 0)
+        stop       — stop collecting when element text contains this string
+        stop_tag   — stop collecting when element tag matches; accepts a string
+                     or a list of tag names
+        stop_attr  — stop collecting when an element attribute matches
+                     (same ``key=substring`` format as ``attr``)
+        stop_regex — stop collecting when element text matches a regex
+        stop_count — max elements to collect in a range
+        to_end     — collect through the final flattened element
+        optional   — if true, suppress warning when step not found
+        regex      — regex with capture group; applied to extracted text
+        date_input_format — explicit strptime format; emits an ISO date
+        split      — split extracted text into a list on this delimiter
+        html       — if true, preserve tag structure in range output as HTML
+        from       — override seek start position (e.g. 0 to search from beginning)
+    """
+    result: dict[str, str | list[str] | None] = {}
+    cursor = start
+
+    for step in steps:
+        tag = step.get("tag")
+        text = step.get("text")
+        match_regex = step.get("match_regex")
+        field = step.get("field")
+        stop = step.get("stop")
+        stop_tag = step.get("stop_tag")
+        stop_tags = {stop_tag} if isinstance(stop_tag, str) else set(stop_tag or [])
+        stop_attr = step.get("stop_attr")
+        stop_regex = step.get("stop_regex")
+        stop_count = step.get("stop_count")
+        to_end = step.get("to_end", False)
+        optional = step.get("optional", False)
+        attr = step.get("attr")
+        regex = step.get("regex")
+        split = step.get("split")
+        date_input_format = step.get("date_input_format")
+        seek_from = step.get("from")
+        offset = step.get("offset", 0)
+        html = step.get("html", False)
+
+        # Ensure every field appears in the result
+        if field and field not in result:
+            result[field] = None
+
+        # Determine seek start
+        start = seek_from if seek_from is not None else cursor
+
+        # Seek forward from start to matching element
+        match_idx = None
+        for i in range(start, len(elements)):
+            el = elements[i]
+            tag_match = tag is None or el["tag"] == tag
+            text_match = text is None or _norm(text) in _norm(el["text"])
+            regex_match = (
+                match_regex is None or re.search(match_regex, el["text"], re.DOTALL) is not None
+            )
+            attr_match = True
+            if attr:
+                if "=" in attr:
+                    a_key, a_val = attr.split("=", 1)
+                    attr_match = a_key in el["attrs"] and a_val in el["attrs"][a_key]
+                else:
+                    attr_match = attr in el["attrs"]
+            if tag_match and text_match and regex_match and attr_match:
+                match_idx = i
+                break
+
+        if match_idx is None:
+            if not optional:
+                warnings.warn(
+                    f"step {step} not found from cursor={start}",
+                    stacklevel=2,
+                )
+            continue
+
+        # Apply offset — skip N elements after the match
+        match_idx = min(match_idx + offset, len(elements) - 1)
+
+        is_range = stop or stop_tag or stop_attr or stop_regex or stop_count or to_end
+
+        if field and is_range:
+            # Collect elements from match, stopping on stop text / stop tag / stop count
+            collected_els: list[dict] = []
+            stop_idx = None
+            for collected, i in enumerate(range(match_idx, len(elements))):
+                # Stop-text and stop-tag checks skip the matched element itself
+                if i != match_idx:
+                    if stop and _norm(stop) in _norm(elements[i]["text"]):
+                        stop_idx = i
+                        break
+                    if elements[i]["tag"] in stop_tags:
+                        stop_idx = i
+                        break
+                    if stop_attr:
+                        if "=" in stop_attr:
+                            a_key, a_val = stop_attr.split("=", 1)
+                            attr_matches = (
+                                a_key in elements[i]["attrs"]
+                                and a_val in elements[i]["attrs"][a_key]
+                            )
+                        else:
+                            attr_matches = stop_attr in elements[i]["attrs"]
+                        if attr_matches:
+                            stop_idx = i
+                            break
+                    if stop_regex and re.search(stop_regex, elements[i]["text"], re.DOTALL):
+                        stop_idx = i
+                        break
+                if stop_count and collected >= stop_count:
+                    stop_idx = i
+                    break
+                collected_els.append(elements[i])
+
+            if html:
+                value = _join_html(collected_els)
+            else:
+                value = "\n".join(el["text"] for el in collected_els)
+
+            # Post-process: regex
+            if regex:
+                m = re.search(regex, value, re.DOTALL)
+                if m:
+                    value = m.group(1).strip()
+
+            if date_input_format is not None:
+                value = _normalize_input_date(value, date_input_format)
+
+            # Post-process: split
+            if split:
+                result[field] = [p for p in value.split(split) if p.strip()]
+            else:
+                result[field] = value
+
+            cursor = stop_idx if stop_idx is not None else match_idx + len(collected_els)
+        elif field:
+            value = elements[match_idx]["text"]
+
+            # Post-process: regex
+            if regex:
+                m = re.search(regex, value, re.DOTALL)
+                if m:
+                    value = m.group(1).strip()
+
+            if date_input_format is not None:
+                value = _normalize_input_date(value, date_input_format)
+
+            # Post-process: split
+            if split:
+                result[field] = [p for p in value.split(split) if p.strip()]
+            else:
+                result[field] = value
+
+            cursor = match_idx + 1
+        else:
+            # Anchor step — just advance cursor
+            cursor = match_idx + 1
+
+    return result, cursor
+
+
+def extract_sections(html: str, steps: list[dict]) -> dict[str, str | list[str] | None]:
+    """Flatten HTML and walk extraction steps in one call."""
+    return walk_steps(flatten(html), steps)[0]

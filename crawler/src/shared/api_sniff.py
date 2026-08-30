@@ -1,0 +1,1858 @@
+"""Shared utilities for API sniffing — detecting job-list APIs via XHR/fetch capture.
+
+Extracted from ``scripts/discover_jobs.py``.  Pure functions operate on
+dataclass structures and require no Playwright; Playwright-dependent helpers
+are grouped at the bottom of the module.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import random
+import re
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlparse, urlunparse
+
+import httpx
+import structlog
+
+from src.shared.http_retry import PaginationFetchError, is_retryable_status
+
+log = structlog.get_logger()
+
+
+class ApiSnifferDomUnavailableError(RuntimeError):
+    """The page cannot safely run API-sniffer fallback interactions."""
+
+
+class ApiSnifferItemValidationError(ValueError):
+    """A strict API item list contained a non-object member."""
+
+
+# ---------------------------------------------------------------------------
+# Transport abstraction
+# ---------------------------------------------------------------------------
+
+FetchJsonFn = Callable[[str, str, dict, str | None], Awaitable[object]]
+"""(method, url, headers, body) -> parsed JSON. Raises on error."""
+
+ItemProjector = Callable[[dict], dict]
+"""Reduce one API item before it is retained across pagination pages."""
+
+
+def make_browser_fetcher(page) -> FetchJsonFn:
+    """Create a FetchJsonFn that executes fetch() inside the browser context.
+
+    TDM-Reservation respect (#2842, #2925). The response body is parsed
+    inside :func:`fetch_json` which surfaces ``r.status`` and ``r.headers``
+    through the page-evaluate bridge alongside the body text, raises HTTP
+    failures for the shared retry classifier, and invokes
+    :func:`check_browser_response` before returning. A
+    :class:`TDMReservedError` propagates out (not retried) and is
+    treated as a clean board skip by the wrapper in
+    ``processing/board.py``. Symmetric with the static-httpx
+    :func:`make_http_fetcher` path so paginate_all over Playwright
+    (api_sniffer.py:1127, 1347) honours the W3C TDM opt-out.
+    """
+
+    async def _fetch(method: str, url: str, headers: dict, body: str | None) -> object:
+        return await fetch_json(page, method, url, headers, body)
+
+    return _fetch
+
+
+def make_http_fetcher(client) -> FetchJsonFn:
+    """Create a FetchJsonFn that uses httpx for plain HTTP requests."""
+    from src.shared.tdm import check_response as _tdm_check
+
+    async def _fetch(method: str, url: str, headers: dict, body: str | None) -> object:
+        # Strip any case-variant of Accept before setting the canonical one,
+        # so user-supplied lowercase "accept" doesn't race Python's case-
+        # sensitive dict against httpx's case-insensitive Headers class.
+        req_headers = {k: v for k, v in headers.items() if k.lower() != "accept"}
+        req_headers["Accept"] = "application/json"
+        kw: dict = {"headers": req_headers, "timeout": 30}
+        if method.upper() == "POST" and body:
+            kw["content"] = body
+            kw["headers"].setdefault("content-type", "application/json")
+        resp = await client.request(method.upper(), url, **kw)
+        resp.raise_for_status()
+        # TDM-Reservation respect (#2842) — header-only on the JSON
+        # API path. Header-canonical even when the publisher might also
+        # have set a body meta (the JSON shape would not contain HTML).
+        _tdm_check(resp)
+        return resp.json()
+
+    return _fetch
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+SKIP_PATTERNS: tuple[str, ...] = (
+    "google-analytics",
+    "analytics",
+    "dataplane.rum",
+    "doubleclick",
+    "facebook",
+    "hotjar",
+    "sentry",
+    "segment",
+    "amplitude",
+    "mixpanel",
+    "newrelic",
+    "cloudwatch",
+    "boomerang",
+    "demdex.net",
+    "omtrdc.net",
+    "googlesyndication",
+    "googletagmanager",
+    "gtag",
+)
+
+JOB_KEYWORDS = re.compile(
+    r"job|career|position|opening|vacanc|posting|requisition|listing|rolle|stellen",
+    re.IGNORECASE,
+)
+
+TITLE_FIELDS = re.compile(
+    r"^(title|name|job_?title|position_?title|label|heading|role|job_?name"
+    r"|job_?opening_?name)$",
+    re.IGNORECASE,
+)
+
+# Generic ``name``/``label`` keys are useful fallbacks, but reference-data
+# responses (locations, departments, filters) commonly expose those fields too.
+# Prefer arrays with an unambiguous job-title key when API captures otherwise
+# tie, as PeopleWeek's vacancy and vacancy-location endpoints do.
+EXPLICIT_TITLE_FIELDS = re.compile(
+    r"^(job_?title|position_?title|job_?name|job_?opening_?name)$",
+    re.IGNORECASE,
+)
+
+URL_FIELDS = re.compile(
+    r"(url|link|href|path|slug|uri|canonical|apply|detail)",
+    re.IGNORECASE,
+)
+
+COUNT_FIELDS = re.compile(
+    # `total[A-Za-z]+` covers vendor-specific suffixes like Phenom's `totalJob`
+    # (job siblings to the array are always int-valued and evaluated in context,
+    # so the broader match stays anchored to the array's parent object).
+    r"^(total|count|total_?count|total_?results|total_?items|hits|num_?found|result_?count"
+    r"|size|total[A-Za-z]+|nbHits)$",
+    re.IGNORECASE,
+)
+
+ID_FIELDS = re.compile(
+    r"^(id|positionId|position_id|jobId|job_id|reqId|req_id"
+    r"|requisitionId|posting_id|postingId|externalId)$",
+    re.IGNORECASE,
+)
+
+SLUG_FIELDS = re.compile(
+    r"(slug|transformedPostingTitle|transformed_title|url_?slug|seo_?title|url_?title)",
+    re.IGNORECASE,
+)
+
+SIZE_PARAMS: tuple[str, ...] = (
+    "result_limit",
+    "limit",
+    "pageSize",
+    "page_size",
+    "size",
+    "per_page",
+    "perPage",
+    "count",
+    "rows",
+    "hitsPerPage",
+    "num",
+    "rpp",
+    "resultsPerPage",
+    "results_per_page",
+    "itemsPerPage",
+    "items_per_page",
+    "maxResults",
+    "max_results",
+)
+
+PAGINATION_PARAM_DEFAULTS: dict[str, int] = {
+    "page": 1,
+    "pagenumber": 1,
+    "p": 1,
+    "pageno": 1,
+    "offset": 0,
+    "start": 0,
+    "skip": 0,
+    "from": 0,
+}
+
+_DESIRED_PAGE_SIZE = 100
+
+# Headers to strip when replaying requests
+_SKIP_HEADERS = frozenset(
+    {
+        "host",
+        "connection",
+        "content-length",
+        "accept-encoding",
+        "transfer-encoding",
+    }
+)
+
+# ---------------------------------------------------------------------------
+# Field auto-mapping patterns
+# ---------------------------------------------------------------------------
+
+FIELD_PATTERNS: dict[str, re.Pattern] = {
+    "title": re.compile(
+        r"^(title|name|job_?title|position_?title|label|heading|role|job_?name"
+        r"|job_?opening_?name)$",
+        re.I,
+    ),
+    "description": re.compile(
+        r"^(description|body|content|bodyHtml|body_?html|descriptionHtml"
+        r"|description_?html|text|details|job_?description"
+        r"|position_?description_?html|summary)$",
+        re.I,
+    ),
+    "employment_type": re.compile(
+        r"^(employment_?type|type|job_?type|work_?type|contract_?type"
+        r"|employmentType|workType|employment_?status_?label)$",
+        re.I,
+    ),
+    "date_posted": re.compile(
+        r"^(date_?posted|posted_?at|posted_?date|published_?at|created_?at"
+        r"|datePosted|publishedAt|createdAt|publish_?date)$",
+        re.I,
+    ),
+    "job_location_type": re.compile(
+        r"^(job_?location_?type|workplace_?type|remote_?type|location_?type"
+        r"|workplaceType|locationType|isRemote|remote)$",
+        re.I,
+    ),
+}
+
+# Location patterns — match both simple keys and array-of-object patterns
+_LOCATION_KEY_PATTERNS = re.compile(
+    r"^(location|locations|office|offices|city|cities|place|places"
+    r"|requisition_?locations|work_?locations)$",
+    re.I,
+)
+_LOCATION_SUBFIELD_PATTERNS = re.compile(
+    r"^(name|title|city|label|display_?name|displayName|value)$",
+    re.I,
+)
+
+# Metadata patterns — department/team
+_METADATA_PATTERNS: dict[str, re.Pattern] = {
+    "metadata.team": re.compile(
+        r"^(team|department|group|division|org|organization|category"
+        r"|departmentName|teamName|team_?name|department_?name"
+        r"|department_?label)$",
+        re.I,
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Exchange:
+    """A captured request-response pair."""
+
+    method: str
+    url: str
+    request_headers: dict
+    post_data: str | None
+    status: int
+    body: object  # parsed JSON or None
+    content_type: str
+    phase: str  # "load" or "interaction"
+
+
+@dataclass
+class ArrayCandidate:
+    """A JSON array-of-dicts found in a response, with its score."""
+
+    exchange: Exchange
+    json_path: str  # dot path to the array inside the response body
+    items: list[dict]
+    score: int = 0
+
+
+@dataclass
+class PaginationInfo:
+    param_name: str
+    style: str  # "offset", "page", or "cumulative_limit"
+    start_value: int
+    increment: int
+    location: str  # "query" or "body"
+    observed_value: int | None = None
+
+
+@dataclass
+class JobListResult:
+    candidate: ArrayCandidate
+    url_field: str | None
+    total_count: int | None
+    pagination: PaginationInfo | None
+
+
+# ---------------------------------------------------------------------------
+# Pure functions — no Playwright dependency
+# ---------------------------------------------------------------------------
+
+
+_JMESPATH_SAFE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _quote_key(key: str) -> str:
+    """Quote a dict key for use in a jmespath expression if it contains special chars."""
+    if _JMESPATH_SAFE_KEY.match(key):
+        return key
+    escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def find_arrays(obj: object, path: str = "") -> list[tuple[str, list[dict]]]:
+    """Recursively find arrays of 3+ dicts in any JSON structure."""
+    results: list[tuple[str, list[dict]]] = []
+    if isinstance(obj, list):
+        dicts = [x for x in obj if isinstance(x, dict)]
+        if len(dicts) >= 3:
+            results.append((path or "$", dicts))
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            qkey = _quote_key(key)
+            child_path = f"{path}.{qkey}" if path else qkey
+            results.extend(find_arrays(val, child_path))
+    return results
+
+
+def _looks_like_url(value: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    return bool(value.startswith(("http://", "https://", "/")) and len(value) > 5)
+
+
+def _nested_scalar_paths(item: dict, prefix: str = "") -> list[tuple[str, str, object]]:
+    """Return dotted paths for scalar values nested in dictionaries.
+
+    Job-list APIs commonly group canonical links below a small ``links``
+    object. Keep list traversal out of automatic detection: choosing one URL
+    from a list of related links is ambiguous, while dictionary paths map
+    directly onto the field-path syntax already supported by api_sniffer.
+    """
+    paths: list[tuple[str, str, object]] = []
+    for key, value in item.items():
+        path_key = _quote_key(key)
+        path = f"{prefix}.{path_key}" if prefix else path_key
+        if isinstance(value, dict):
+            paths.extend(_nested_scalar_paths(value, path))
+        elif not isinstance(value, (list, tuple, set)):
+            paths.append((path, key, value))
+    return paths
+
+
+def _url_field_priority(key: str) -> int:
+    """Prefer canonical/detail links over application endpoints."""
+    normalized = re.sub(r"[^a-z]", "", key.lower())
+    # Listing APIs commonly expose branded artwork alongside the actual job
+    # link (for example Webcruiter's ``PictureUrl`` + ``OpenAdvertUrl``).
+    # Artwork must never become the posting identity merely because it appears
+    # first in the response object.
+    if any(token in normalized for token in ("image", "picture", "logo", "thumbnail", "avatar")):
+        return -1
+    if "canonical" in normalized:
+        return 100
+    if "apply" in normalized:
+        return 10
+    if any(token in normalized for token in ("job", "advert", "posting", "position")) and any(
+        token in normalized for token in ("url", "link", "href", "path", "uri")
+    ):
+        return 95
+    if "directlink" in normalized or "detail" in normalized:
+        return 90
+    if "url" in normalized or "href" in normalized:
+        return 80
+    if "link" in normalized:
+        return 70
+    if "slug" in normalized or "path" in normalized or "uri" in normalized:
+        return 60
+    return 0
+
+
+def find_url_field(items: list[dict]) -> str | None:
+    """Detect which field holds job URLs, including nested link objects."""
+    if not items:
+        return None
+    sample = items[:5]
+
+    # Rank named candidates across both top-level and nested dictionary paths,
+    # e.g. Prospective's ``links.directlink``. Considering them together makes
+    # a canonical/detail page win even when the sibling apply URL is top-level.
+    from src.shared.nextdata import resolve_path
+
+    candidates: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+    for path, key, _value in _nested_scalar_paths(sample[0]):
+        if path in seen or not URL_FIELDS.search(key):
+            continue
+        seen.add(path)
+        priority = _url_field_priority(key)
+        if priority < 0:
+            continue
+        values = [resolve_path(item, path) for item in sample]
+        if values and all(isinstance(value, str) and _looks_like_url(value) for value in values):
+            candidates.append((priority, -len(candidates), path))
+    if candidates:
+        return max(candidates)[2]
+
+    # Value-pattern fallback for APIs whose URL field has an unusual name.
+    # Keep this at the top level to avoid selecting unrelated nested links.
+    for key, value in sample[0].items():
+        if isinstance(value, (dict, list, tuple, set)):
+            continue
+        if _url_field_priority(key) < 0:
+            continue
+        path = _quote_key(key)
+        values = [resolve_path(item, path) for item in sample]
+        if all(isinstance(value, str) and _looks_like_url(value) for value in values):
+            return path
+
+    return None
+
+
+def find_total_count(body: object, array_path: str) -> int | None:
+    """Find a count/total sibling field near the array."""
+    if not isinstance(body, dict):
+        return None
+
+    from src.shared.nextdata import resolve_path
+
+    # Walk to parent of the array
+    parts = array_path.split(".")
+    parent_path = ".".join(parts[:-1])
+    obj = resolve_path(body, parent_path) if parent_path else body
+    if obj is None:
+        obj = body
+
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            if COUNT_FIELDS.match(key) and isinstance(val, (int, float)):
+                return int(val)
+
+    # Also check top-level
+    if isinstance(body, dict) and obj is not body:
+        for key, val in body.items():
+            if COUNT_FIELDS.match(key) and isinstance(val, (int, float)):
+                return int(val)
+
+    return None
+
+
+def _schema_uniformity(items: list[dict]) -> float:
+    """Return 0-1 how uniform the keys are across items."""
+    if len(items) < 2:
+        return 1.0
+    key_sets = [frozenset(it.keys()) for it in items[:20]]
+    base = key_sets[0]
+    matches = sum(1 for ks in key_sets[1:] if ks == base)
+    return matches / (len(key_sets) - 1)
+
+
+def score_candidate(cand: ArrayCandidate, page_url: str) -> int:
+    """Score an array-of-dicts candidate as a job list."""
+    score = 0
+    items = cand.items
+    ex = cand.exchange
+
+    # URL field
+    url_field = find_url_field(items)
+    if url_field:
+        score += 30
+
+    # Title field
+    sample_keys: set[str] = set()
+    for it in items[:5]:
+        sample_keys.update(it.keys())
+    if any(TITLE_FIELDS.match(k) for k in sample_keys):
+        score += 15
+    if any(EXPLICIT_TITLE_FIELDS.match(k) for k in sample_keys):
+        score += 10
+
+    # Job keyword in API URL or JSON path
+    if JOB_KEYWORDS.search(ex.url) or JOB_KEYWORDS.search(cand.json_path):
+        score += 10
+
+    # Total count sibling
+    total = find_total_count(ex.body, cand.json_path)
+    if total is not None:
+        score += 10
+
+    # Schema uniformity
+    if _schema_uniformity(items) > 0.8:
+        score += 10
+
+    # Array size
+    if len(items) >= 10:
+        score += 5
+
+    # Same origin
+    if urlparse(ex.url).netloc == urlparse(page_url).netloc:
+        score += 5
+
+    # Penalty: items with < 3 keys (likely config/nav, not jobs)
+    avg_keys = sum(len(it) for it in items[:10]) / min(len(items), 10)
+    if avg_keys < 3:
+        score -= 20
+
+    cand.score = score
+    return score
+
+
+def detect_job_list(exchanges: list[Exchange], page_url: str) -> JobListResult | None:
+    """Score all JSON arrays across all exchanges, return the best match."""
+    candidates: list[ArrayCandidate] = []
+
+    for ex in exchanges:
+        if ex.body is None:
+            continue
+        arrays = find_arrays(ex.body)
+        for path, items in arrays:
+            cand = ArrayCandidate(exchange=ex, json_path=path, items=items)
+            score_candidate(cand, page_url)
+            candidates.append(cand)
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda c: c.score, reverse=True)
+
+    for c in candidates[:5]:
+        log.debug(
+            "api_sniff.candidate",
+            score=c.score,
+            path=c.json_path,
+            items=len(c.items),
+            url=c.exchange.url[:100],
+        )
+
+    best = candidates[0]
+    if best.score < 10:
+        log.debug("api_sniff.score_too_low", score=best.score)
+        return None
+
+    url_field = find_url_field(best.items)
+    total_count = find_total_count(best.exchange.body, best.json_path)
+
+    return JobListResult(
+        candidate=best,
+        url_field=url_field,
+        total_count=total_count,
+        pagination=None,
+    )
+
+
+def extract_urls(items: list[dict], url_field: str | None, page_url: str) -> list[str]:
+    """Normalize relative->absolute URLs from JSON items."""
+    urls = []
+    if url_field:
+        from src.shared.nextdata import resolve_path
+
+        for item in items:
+            val = resolve_path(item, url_field)
+            if isinstance(val, str) and val:
+                urls.append(urljoin(page_url, val))
+    else:
+        for item in items:
+            for val in item.values():
+                if _looks_like_url(str(val)):
+                    urls.append(urljoin(page_url, str(val)))
+                    break
+    return urls
+
+
+# ---------------------------------------------------------------------------
+# Pagination inference — pure
+# ---------------------------------------------------------------------------
+
+
+def _diff_query_params(url1: str, url2: str) -> tuple[str, int, int] | None:
+    """Find the single query param that changed numerically between two URLs."""
+    p1 = parse_qs(urlparse(url1).query)
+    p2 = parse_qs(urlparse(url2).query)
+    all_keys = set(p1) | set(p2)
+    diffs = []
+    for key in all_keys:
+        v1_raw = p1.get(key, [""])[0]
+        v2_raw = p2.get(key, [""])[0]
+        if v1_raw == v2_raw:
+            continue
+        try:
+            v1 = int(v1_raw) if v1_raw != "" else None
+            v2 = int(v2_raw) if v2_raw != "" else None
+        except (ValueError, TypeError):
+            continue
+        if v1 is None or v2 is None:
+            default = PAGINATION_PARAM_DEFAULTS.get(key.lower())
+            if default is not None:
+                v1 = v1 if v1 is not None else default
+                v2 = v2 if v2 is not None else default
+            else:
+                continue
+        diffs.append((key, v1, v2))
+    if len(diffs) == 1:
+        return diffs[0]
+    return None
+
+
+def _diff_json_bodies(body1: str | None, body2: str | None) -> tuple[str, int, int] | None:
+    """Deep-diff two JSON bodies to find the single changed numeric field."""
+    if not body1 or not body2:
+        return None
+    try:
+        j1 = json.loads(body1) if isinstance(body1, str) else body1
+        j2 = json.loads(body2) if isinstance(body2, str) else body2
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    diffs: list[tuple[str, int, int]] = []
+
+    def walk(a: object, b: object, path: str = "") -> None:
+        if isinstance(a, dict) and isinstance(b, dict):
+            for key in set(a) | set(b):
+                walk(a.get(key), b.get(key), f"{path}.{key}" if path else key)
+        elif a != b:
+            with contextlib.suppress(ValueError, TypeError):
+                diffs.append((path, int(a), int(b)))  # type: ignore[arg-type]
+
+    walk(j1, j2)
+    if len(diffs) == 1:
+        return diffs[0]
+    return None
+
+
+def infer_pagination(
+    exchanges: list[Exchange],
+    best_url: str,
+    page_size: int,
+) -> PaginationInfo | None:
+    """Infer pagination from two exchanges to the same endpoint, or from URL patterns."""
+    parsed = urlparse(best_url)
+    matching = [
+        ex
+        for ex in exchanges
+        if urlparse(ex.url).path == parsed.path and urlparse(ex.url).netloc == parsed.netloc
+    ]
+
+    # Deduplicate by URL + post_data
+    seen_keys: set[tuple[str, str | None]] = set()
+    unique_matching: list[Exchange] = []
+    for ex in matching:
+        key = (ex.url, ex.post_data)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_matching.append(ex)
+
+    if len(unique_matching) >= 2:
+        pairs = []
+        for i, ex1 in enumerate(unique_matching):
+            for ex2 in unique_matching[i + 1 :]:
+                priority = 0 if ex1.phase != ex2.phase else 1
+                pairs.append((priority, ex1, ex2))
+        pairs.sort(key=lambda x: x[0])
+
+        for _, ex1, ex2 in pairs:
+            diff = _diff_query_params(ex1.url, ex2.url)
+            if diff:
+                name, v1, v2 = diff
+                inc = abs(v2 - v1)
+                style = "offset" if inc == page_size else "page"
+                return PaginationInfo(
+                    param_name=name,
+                    style=style,
+                    start_value=min(v1, v2),
+                    increment=inc,
+                    location="query",
+                )
+
+            diff = _diff_json_bodies(ex1.post_data, ex2.post_data)
+            if diff:
+                name, v1, v2 = diff
+                inc = abs(v2 - v1)
+                style = "offset" if inc == page_size else "page"
+                return PaginationInfo(
+                    param_name=name,
+                    style=style,
+                    start_value=min(v1, v2),
+                    increment=inc,
+                    location="body",
+                )
+
+    # Single exchange fallback: look for obvious params
+    best_ex = next(
+        (ex for ex in matching if ex.url == best_url),
+        matching[0] if matching else None,
+    )
+    if best_ex is None:
+        return None
+
+    qs = parse_qs(urlparse(best_ex.url).query)
+
+    for param in ("offset", "start", "skip", "from"):
+        if param in qs:
+            try:
+                val = int(qs[param][0])
+                return PaginationInfo(
+                    param_name=param,
+                    style="offset",
+                    start_value=0,
+                    increment=page_size,
+                    location="query",
+                    observed_value=val,
+                )
+            except (ValueError, TypeError):
+                # Non-numeric candidate; keep scanning other pagination parameter names.
+                pass
+
+    for param in ("page", "pageNumber", "p", "pageNo"):
+        if param in qs:
+            try:
+                val = int(qs[param][0])
+                return PaginationInfo(
+                    param_name=param,
+                    style="page",
+                    start_value=1,
+                    increment=1,
+                    location="query",
+                    observed_value=val,
+                )
+            except (ValueError, TypeError):
+                # Non-numeric candidate; keep scanning other pagination parameter names.
+                pass
+
+    # Check POST body
+    if best_ex.post_data:
+        try:
+            body = json.loads(best_ex.post_data)
+            if isinstance(body, dict):
+                for param in ("offset", "start", "skip", "from"):
+                    if param in body:
+                        try:
+                            val = int(body[param])
+                            return PaginationInfo(
+                                param_name=param,
+                                style="offset",
+                                start_value=0,
+                                increment=page_size,
+                                location="body",
+                                observed_value=val,
+                            )
+                        except (ValueError, TypeError):
+                            # Non-numeric candidate; keep scanning other known parameter names.
+                            pass
+                for param in ("page", "pageNumber", "p", "pageNo"):
+                    if param in body:
+                        try:
+                            val = int(body[param])
+                            return PaginationInfo(
+                                param_name=param,
+                                style="page",
+                                start_value=1,
+                                increment=1,
+                                location="body",
+                                observed_value=val,
+                            )
+                        except (ValueError, TypeError):
+                            # Non-numeric candidate; keep scanning other known parameter names.
+                            pass
+        except (json.JSONDecodeError, TypeError):
+            # Non-JSON bodies are not JSON pagination candidates.
+            pass
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# URL / body parameter helpers — pure
+# ---------------------------------------------------------------------------
+
+
+def set_url_param(url: str, param: str, value: object) -> str:
+    """Set a single query param in a URL."""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    qs[param] = [str(value)]
+    return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+
+
+def _parse_multipart_boundary(body_str: str) -> str | None:
+    """Extract boundary from a multipart/form-data body string."""
+    # Boundaries start with -- followed by the boundary token
+    match = re.match(r"^(------?[\w]+)", body_str)
+    return match.group(1) if match else None
+
+
+def _set_multipart_param(body_str: str, param: str, value: object) -> str:
+    """Set a single field in a multipart/form-data body string."""
+    boundary = _parse_multipart_boundary(body_str)
+    if not boundary:
+        return body_str
+    # Match the field: boundary + Content-Disposition with name="param" + blank line + value
+    pattern = re.compile(
+        re.escape(boundary)
+        + r'\r\nContent-Disposition: form-data; name="'
+        + re.escape(param)
+        + r'"\r\n\r\n'
+        + r"(.*?)"
+        + r"(?=\r\n"
+        + re.escape(boundary)
+        + r")",
+        re.DOTALL,
+    )
+    replacement = (
+        boundary + '\r\nContent-Disposition: form-data; name="' + param + '"\r\n\r\n' + str(value)
+    )
+    new_body, count = pattern.subn(replacement, body_str, count=1)
+    return new_body if count else body_str
+
+
+def _get_multipart_param(body_str: str, param: str) -> str | None:
+    """Read a single field value from a multipart/form-data body string."""
+    boundary = _parse_multipart_boundary(body_str)
+    if not boundary:
+        return None
+    pattern = re.compile(
+        re.escape(boundary)
+        + r'\r\nContent-Disposition: form-data; name="'
+        + re.escape(param)
+        + r'"\r\n\r\n'
+        + r"(.*?)"
+        + r"(?=\r\n"
+        + re.escape(boundary)
+        + r")",
+        re.DOTALL,
+    )
+    match = pattern.search(body_str)
+    return match.group(1) if match else None
+
+
+def _is_multipart(body_str: str) -> bool:
+    """Check if a body string looks like multipart/form-data."""
+    return body_str.startswith("----") if body_str else False
+
+
+def set_body_param(body_str: str, param: str, value: object) -> str:
+    """Set a single field in a JSON, multipart, or URL-encoded POST body."""
+    if _is_multipart(body_str):
+        return _set_multipart_param(body_str, param, value)
+    try:
+        body = json.loads(body_str)
+    except (json.JSONDecodeError, TypeError):
+        try:
+            fields = parse_qsl(body_str, keep_blank_values=True, max_num_fields=1_024)
+        except ValueError:
+            return body_str
+        if not fields or param not in {key for key, _value in fields}:
+            return body_str
+        return urlencode(
+            [(key, str(value) if key == param else current) for key, current in fields]
+        )
+    parts = param.split(".")
+    obj = body
+    for part in parts[:-1]:
+        obj = obj[part]
+    obj[parts[-1]] = value
+    return json.dumps(body)
+
+
+def detect_size_param(url: str, post_data: str | None) -> tuple[str, str, int] | None:
+    """Find a page-size param in the request. Returns (name, location, value)."""
+    qs = parse_qs(urlparse(url).query)
+    for param in SIZE_PARAMS:
+        if param in qs:
+            try:
+                return (param, "query", int(qs[param][0]))
+            except (ValueError, TypeError):
+                # Non-numeric candidate; keep scanning other size parameter names.
+                pass
+    if post_data:
+        if _is_multipart(post_data):
+            for param in SIZE_PARAMS:
+                val = _get_multipart_param(post_data, param)
+                if val is not None:
+                    try:
+                        return (param, "body", int(val))
+                    except (ValueError, TypeError):
+                        # Non-numeric candidate; keep scanning other size parameter names.
+                        pass
+        else:
+            try:
+                body = json.loads(post_data)
+                if isinstance(body, dict):
+                    for param in SIZE_PARAMS:
+                        if param in body:
+                            try:
+                                return (param, "body", int(body[param]))
+                            except (ValueError, TypeError):
+                                # Non-numeric candidate; keep scanning other size parameter names.
+                                pass
+            except (json.JSONDecodeError, TypeError):
+                # Non-JSON bodies are not JSON size-parameter candidates.
+                pass
+    return None
+
+
+def extract_items(
+    data: object,
+    target_path: str,
+    *,
+    require_object_items: bool = False,
+) -> list[dict]:
+    """Extract the job array from a parsed JSON response."""
+    # Resolve the configured expression first.  ``find_arrays`` can only
+    # describe literal list nodes, so JMESPath projections such as
+    # ``jobs.*`` (a dict keyed by requisition ID) otherwise work on the
+    # first page but disappear during pagination.  An exact empty result
+    # must also stay empty instead of falling back to an unrelated array in
+    # the response (for example, filter values).
+    if target_path:
+        from src.shared.nextdata import resolve_path
+
+        resolved = data if target_path == "$" else resolve_path(data, target_path)
+        if isinstance(resolved, list):
+            if require_object_items:
+                invalid_index = next(
+                    (index for index, item in enumerate(resolved) if not isinstance(item, dict)),
+                    None,
+                )
+                if invalid_index is not None:
+                    raise ApiSnifferItemValidationError(
+                        "api_sniffer required identity list contains a non-object item "
+                        f"at index {invalid_index}"
+                    )
+            return [item for item in resolved if isinstance(item, dict)]
+        # A configured path is authoritative. Missing/null/non-list data is
+        # an empty page, not permission to ingest an unrelated response array.
+        return []
+
+    arrays = find_arrays(data)
+    # Without a configured path, retain the probe heuristic: largest array.
+    if arrays:
+        return max(arrays, key=lambda x: len(x[1]))[1]
+    return []
+
+
+def clean_headers(headers: dict) -> dict:
+    """Strip headers that shouldn't be forwarded in replayed requests."""
+    return {k: v for k, v in headers.items() if k.lower() not in _SKIP_HEADERS}
+
+
+# ---------------------------------------------------------------------------
+# Field auto-mapping
+# ---------------------------------------------------------------------------
+
+
+def auto_map_fields(items: list[dict]) -> dict[str, str]:
+    """Auto-detect field mapping from sample items.
+
+    Returns a dict mapping DiscoveredJob field names to JSON key paths,
+    using the same spec notation as nextdata (``key``, ``nested.key``,
+    ``array[].field``).
+    """
+    if not items:
+        return {}
+    sample = items[:5]
+    mapping: dict[str, str] = {}
+
+    # Collect all top-level keys from sample
+    all_keys: set[str] = set()
+    for item in sample:
+        all_keys.update(item.keys())
+
+    # Simple field matching
+    for field_name, pattern in FIELD_PATTERNS.items():
+        for key in all_keys:
+            if pattern.match(key):
+                mapping[field_name] = key
+                break
+
+    # ADP MyJobs exposes a generic requisition ``type`` (usually ``Normal``)
+    # alongside the useful schedule in ``workLevelCode``. Prefer the latter
+    # when present so auto-discovery does not label every job with an opaque
+    # provider-internal value.
+    if any(isinstance(item.get("workLevelCode"), str) and item["workLevelCode"] for item in sample):
+        mapping["employment_type"] = "workLevelCode"
+
+    # ADP MyJobs also labels requisitionLocations with property codes such as
+    # ``4121-Hotel Monaco SLC`` while the nested address contains the actual
+    # candidate-facing geography. Handle that shape before the generic
+    # location-name heuristic. The filter projection drops missing address
+    # parts, so countries without a state/province remain clean.
+    requisition_locations = next(
+        (
+            item.get("requisitionLocations")
+            for item in sample
+            if isinstance(item.get("requisitionLocations"), list) and item["requisitionLocations"]
+        ),
+        None,
+    )
+    if isinstance(requisition_locations, list) and isinstance(requisition_locations[0], dict):
+        address = requisition_locations[0].get("address")
+        if isinstance(address, dict) and isinstance(address.get("cityName"), str):
+            mapping["locations"] = (
+                "requisitionLocations[].join(', ', "
+                "[address.cityName, address.countrySubdivisionLevel1.codeValue, "
+                "address.country.longName][?@])"
+            )
+
+    # Location matching — handles both simple strings and array-of-objects
+    for key in all_keys:
+        if "locations" in mapping:
+            break
+        if _LOCATION_KEY_PATTERNS.match(key):
+            # Check the type of value in sample items
+            sample_vals = [item.get(key) for item in sample if key in item]
+            if not sample_vals:
+                continue
+            first = sample_vals[0]
+            if isinstance(first, str):
+                mapping["locations"] = key
+                break
+            if isinstance(first, list):
+                if first and isinstance(first[0], str):
+                    mapping["locations"] = key
+                    break
+                if first and isinstance(first[0], dict):
+                    # ADP MyJobs wraps the display label one level deeper:
+                    # requisitionLocations[].nameCode.{shortName,longName}.
+                    # Prefer the concise label when both variants exist.
+                    name_code = first[0].get("nameCode")
+                    if isinstance(name_code, dict):
+                        for subkey in ("shortName", "longName"):
+                            if isinstance(name_code.get(subkey), str):
+                                mapping["locations"] = f"{key}[].nameCode.{subkey}"
+                                break
+                        if "locations" in mapping:
+                            break
+                    # Find the name subfield
+                    for subkey in first[0]:
+                        if _LOCATION_SUBFIELD_PATTERNS.match(subkey):
+                            mapping["locations"] = f"{key}[].{subkey}"
+                            break
+                    else:
+                        # Fall back to first string-valued key
+                        for subkey, subval in first[0].items():
+                            if isinstance(subval, str):
+                                mapping["locations"] = f"{key}[].{subkey}"
+                                break
+                    break
+            if isinstance(first, dict):
+                # BambooHR and similar APIs return a single location object
+                # (for example ``{"city": "Sheffield", "state": "..."}``)
+                # instead of an array. Prefer a recognised display subfield.
+                for subkey in first:
+                    if _LOCATION_SUBFIELD_PATTERNS.match(subkey):
+                        mapping["locations"] = f"{key}.{subkey}"
+                        break
+                else:
+                    for subkey, subval in first.items():
+                        if isinstance(subval, str) and subval:
+                            mapping["locations"] = f"{key}.{subkey}"
+                            break
+                break
+
+    # Metadata patterns (team/department)
+    for field_name, pattern in _METADATA_PATTERNS.items():
+        for key in all_keys:
+            if pattern.match(key):
+                # Check for nested objects
+                sample_vals = [item.get(key) for item in sample if key in item]
+                if sample_vals and isinstance(sample_vals[0], dict):
+                    # Use .name or first string field
+                    inner = sample_vals[0]
+                    for subkey in ("name", "title", "label"):
+                        if subkey in inner:
+                            mapping[field_name] = f"{key}.{subkey}"
+                            break
+                    else:
+                        for subkey, subval in inner.items():
+                            if isinstance(subval, str):
+                                mapping[field_name] = f"{key}.{subkey}"
+                                break
+                else:
+                    mapping[field_name] = key
+                break
+
+    return mapping
+
+
+# ---------------------------------------------------------------------------
+# Playwright-dependent functions
+# ---------------------------------------------------------------------------
+
+
+async def capture_exchanges(page, page_host: str) -> list[Exchange]:
+    """Attach a response listener that captures JSON XHR/fetch pairs.
+
+    Call this *before* navigation so that load-time requests are captured.
+    Returns a mutable list that grows as responses arrive.
+    """
+    exchanges: list[Exchange] = []
+
+    async def on_response(resp) -> None:
+        req = resp.request
+        if req.resource_type not in ("xhr", "fetch"):
+            return
+        if any(p in req.url.lower() for p in SKIP_PATTERNS):
+            return
+        ct = resp.headers.get("content-type", "")
+        try:
+            text = await resp.text()
+            if not text or len(text) < 2:
+                return
+            body = json.loads(text)
+        except Exception:
+            return
+        try:
+            post_data = req.post_data
+        except Exception:
+            post_data = None
+        exchanges.append(
+            Exchange(
+                method=req.method,
+                url=req.url,
+                request_headers=dict(req.headers),
+                post_data=post_data,
+                status=resp.status,
+                body=body,
+                content_type=ct,
+                phase="load",
+            )
+        )
+
+    page.on("response", on_response)
+    return exchanges
+
+
+async def trigger_interactions(page, exchanges: list[Exchange]) -> None:
+    """Dismiss overlays and trigger pagination / load-more to capture more exchanges."""
+    try:
+        has_body = await page.evaluate("() => document.body !== null")
+    except Exception as exc:
+        raise ApiSnifferDomUnavailableError(
+            "API sniffer fallback interactions require a usable document body"
+        ) from exc
+    if not has_body:
+        raise ApiSnifferDomUnavailableError(
+            "API sniffer fallback interactions require a usable document body"
+        )
+
+    before = len(exchanges)
+
+    # Phase A: search button click for Taleo/Workday-style pages
+    if len(exchanges) <= 1:
+        searched = await page.evaluate("""() => {
+            const searchBtn = document.querySelector(
+                'button[id*="earch"], input[type="submit"], button[type="submit"], '
+                + '[class*="search-btn"], [class*="SearchBtn"], [class*="searchButton"], '
+                + 'button[class*="search"], [id*="btnSearch"]'
+            );
+            if (searchBtn) { searchBtn.click(); return 'search-btn'; }
+            const allBtns = [...document.querySelectorAll(
+                'a, button, input[type="button"]')];
+            const srch = allBtns.find(el =>
+                /^search$/i.test(el.textContent.trim()) || el.value === 'Search');
+            if (srch) { srch.click(); return 'search-text'; }
+            return null;
+        }""")
+        if searched:
+            log.debug("api_sniff.search_clicked", type=searched)
+            await asyncio.sleep(5)
+
+    before_pagination = len(exchanges)
+
+    # Phase B: Pagination clicks
+    clicked = await page.evaluate("""() => {
+        const byAria = document.querySelector(
+            '[aria-label*="page 2"], [aria-label*="Page 2"], [aria-label="Next"]'
+        );
+        if (byAria) { byAria.click(); return 'aria'; }
+        const allLinks = [...document.querySelectorAll(
+            'a, button, span[role="link"], span[tabindex]')];
+        const page2 = allLinks.find(el =>
+            el.textContent.trim() === '2' &&
+            el.closest('[class*="pagin"], [class*="pager"], [role="navigation"]')
+        );
+        if (page2) { page2.click(); return 'page2'; }
+        const next = allLinks.find(el =>
+            /^(Next|Load more|Show more|View more)$/i.test(el.textContent.trim())
+        );
+        if (next) { next.click(); return 'next'; }
+        const showMore = allLinks.find(el =>
+            /show\\s*more|load\\s*more|view\\s*more/i.test(el.textContent.trim())
+        );
+        if (showMore) { showMore.click(); return 'show-more'; }
+        return null;
+    }""")
+    if clicked:
+        log.debug("api_sniff.pagination_clicked", type=clicked)
+        await asyncio.sleep(3)
+
+    # CSS-based fallback
+    if len(exchanges) == before_pagination:
+        for sel in [
+            '[aria-label*="page 2"]',
+            '[aria-label*="Page 2"]',
+            'a[href*="page=2"]',
+            ".pagination li:nth-child(2) a",
+            'button:has-text("Next")',
+            'a:has-text("Next")',
+            '[aria-label="Next"]',
+            ".next a",
+            ".next button",
+            'button:has-text("Load more")',
+            'button:has-text("Show more")',
+            'button:has-text("View more")',
+            'a:has-text("View more")',
+        ]:
+            try:
+                await page.click(sel, timeout=2000, force=True)
+            except Exception:
+                continue
+            await asyncio.sleep(3)
+            if len(exchanges) > before_pagination:
+                log.debug("api_sniff.css_clicked", selector=sel)
+                break
+
+    # Scroll to bottom for infinite-scroll triggers
+    if len(exchanges) == before_pagination:
+        scrolled = await page.evaluate("""() => {
+            const root =
+                document.scrollingElement || document.documentElement || document.body;
+            if (!root) return false;
+            window.scrollTo(0, root.scrollHeight);
+            return true;
+        }""")
+        if not scrolled:
+            raise ApiSnifferDomUnavailableError(
+                "API sniffer fallback interactions require a usable document body"
+            )
+        await asyncio.sleep(3)
+
+    for ex in exchanges[before:]:
+        ex.phase = "interaction"
+
+    log.debug("api_sniff.interactions", new_exchanges=len(exchanges) - before)
+
+
+async def fetch_json(
+    page,
+    method: str,
+    url: str,
+    headers: dict,
+    body: str | None,
+) -> object:
+    """Execute a fetch inside the browser context, return parsed JSON.
+
+    TDM-Reservation respect (#2842, #2925). The page-evaluate bridge
+    surfaces ``r.status`` and ``r.headers`` (entries materialised into a plain object
+    with lower-cased keys, since ``Headers`` itself isn't directly
+    serialisable across the bridge) alongside the body text so
+    :func:`check_browser_response` can run on the Playwright path —
+    symmetric with the static-httpx ``make_http_fetcher`` hook. A
+    :class:`TDMReservedError` propagates out (not retried) per the
+    publisher-policy semantics.
+    """
+    from src.shared.tdm import check_browser_response
+
+    result = await page.evaluate(
+        """async ([method, url, headers, body]) => {
+        const opts = { method, headers: JSON.parse(headers) };
+        if (body) opts.body = body;
+        const resp = await fetch(url, opts);
+        const respHeaders = {};
+        for (const [k, v] of resp.headers.entries()) {
+            respHeaders[k.toLowerCase()] = v;
+        }
+        return { status: resp.status, headers: respHeaders, text: await resp.text() };
+    }""",
+        [method, url, json.dumps(headers), body],
+    )
+    # ``result`` is the JS object literal — ``{headers, text}``. If
+    # something upstream malformed it (a script substituting a
+    # rejection, a navigation completing with a non-dict value), the
+    # ``result["text"]`` lookup raises ``AttributeError`` /
+    # ``TypeError`` which is surfaced to the caller's retry budget in
+    # ``_fetch_page_with_retry``. No defensive shape-check needed.
+    text = result["text"]
+    resp_headers = result.get("headers") or {}
+    status = result.get("status", 200)
+    if not isinstance(status, int):
+        raise TypeError("browser fetch returned an invalid HTTP status")
+    if not 200 <= status < 300:
+        response = httpx.Response(
+            status,
+            headers=resp_headers,
+            text=text,
+            request=httpx.Request(method, url),
+        )
+        response.raise_for_status()
+    check_browser_response(resp_headers, text, url=url)
+    return json.loads(text)
+
+
+# Retry budget for the api_sniff ``paginate_all`` pagination loop —
+# wraps both ``make_http_fetcher`` (httpx) and ``make_browser_fetcher``
+# (Playwright) transports. Same cadence as ``http_fetch_with_retry``
+# in api_sniffer.py for cross-call consistency.
+_PAGINATE_FETCH_RETRIES = 3
+_PAGINATE_FETCH_BASE_DELAY = 1.0
+
+
+async def _fetch_page_with_retry(
+    fetch_fn: FetchJsonFn,
+    method: str,
+    url: str,
+    headers: dict,
+    body: str | None,
+    *,
+    retries: int = _PAGINATE_FETCH_RETRIES,
+    base_delay: float = _PAGINATE_FETCH_BASE_DELAY,
+) -> object:
+    """Wrap a :data:`FetchJsonFn` with bounded retries (#2733).
+
+    Used by :func:`paginate_all` to convert the prior silent-on-failure
+    pagination loop (a single ``except Exception: break`` at the
+    fetch site) into a retry-then-raise contract that matches the
+    dom/sitemap/PCSX/accenture monitors.
+
+    Behaviour:
+
+    - Returns ``fetch_fn``'s normal result on success.
+    - Retries on ``httpx.HTTPStatusError`` whose status is retryable
+      (``is_retryable_status``: 5xx including Cloudflare 520-526/530,
+      plus 408/425/429), and on any other ``Exception`` (Playwright
+      errors, network errors, JSON parse errors).
+    - Raises :class:`PaginationFetchError` immediately on a
+      non-retryable 4xx (e.g. 401, 403, 400) — those won't recover.
+    - Raises :class:`PaginationFetchError` after the retry budget is
+      exhausted.
+
+    ``fetch_fn`` is the abstraction shared between the httpx and
+    Playwright transports (see :func:`make_http_fetcher` /
+    :func:`make_browser_fetcher`); the retry classifier handles each
+    transport's exception shape uniformly.
+
+    TDM-Reservation respect (#2842, #2925) — :class:`TDMReservedError`
+    raised by either transport (httpx or browser) propagates
+    immediately, bypassing the retry budget, since the publisher's W3C
+    opt-out signal is not transient.
+    """
+    # Retry observability (#3210). Same counter as ``http_retry.py`` so a
+    # Grafana ``rate(crawler_http_retry_attempts_total[5m])`` query
+    # aggregates the static-httpx and api_sniff paths into one view.
+    from src.metrics import http_retry_attempts_total, http_retry_host
+    from src.shared.tdm import TDMReservedError
+
+    host = http_retry_host(url)
+
+    last_exc: BaseException | None = None
+    last_status: int | None = None
+    retried = False
+
+    for attempt in range(retries):
+        try:
+            result = await fetch_fn(method, url, headers, body)
+            if retried:
+                http_retry_attempts_total.labels(host=host, outcome="recovered").inc()
+            return result
+        except TDMReservedError:
+            # Publisher policy declaration — propagate, never retry.
+            raise
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            last_status = status
+            last_exc = exc
+            if not is_retryable_status(status):
+                # Non-transient — fail loudly so the run is recorded as
+                # a failure rather than truncating to whatever pages
+                # happened to succeed.
+                raise PaginationFetchError(
+                    url,
+                    attempts=attempt + 1,
+                    last_status=status,
+                ) from exc
+            http_retry_attempts_total.labels(host=host, outcome="retry").inc()
+            retried = True
+        except Exception as exc:  # noqa: BLE001 — Playwright errors, timeouts, parse errors
+            last_exc = exc
+            last_status = None
+            http_retry_attempts_total.labels(host=host, outcome="retry").inc()
+            retried = True
+
+        if attempt < retries - 1:
+            delay = base_delay * (2**attempt) * (0.5 + random.random())
+            log.info(
+                "api_sniff.paginate_backoff",
+                url=url,
+                attempt=attempt + 1,
+                delay_s=round(delay, 2),
+                last_status=last_status,
+                last_error=type(last_exc).__name__ if last_exc else None,
+            )
+            await asyncio.sleep(delay)
+
+    http_retry_attempts_total.labels(host=host, outcome="exhausted").inc()
+    raise PaginationFetchError(
+        url,
+        attempts=retries,
+        last_status=last_status,
+        last_error=type(last_exc).__name__ if last_exc else None,
+    )
+
+
+async def paginate_all(
+    fetch_fn: FetchJsonFn,
+    result: JobListResult,
+    max_pages: int,
+    *,
+    item_projector: ItemProjector | None = None,
+    require_object_items: bool = False,
+) -> list[dict]:
+    """Fetch all pages of a paginated API using the given transport function.
+
+    ``item_projector`` is applied as each page arrives.  This lets callers
+    discard unused fields before thousands of response objects accumulate in
+    memory while preserving pagination decisions based on the original page.
+    When ``require_object_items`` is enabled, every raw list member must be an
+    object before projection or filtering on every fetched page.
+    """
+    pag = result.pagination
+    ex = result.candidate.exchange
+    project = item_projector or (lambda item: item)
+    all_items = [project(item) for item in result.candidate.items]
+
+    if pag is None:
+        return all_items
+
+    page_size = len(result.candidate.items)
+    if page_size == 0:
+        return all_items
+
+    headers = clean_headers(ex.request_headers)
+
+    # Some search APIs expose only a cumulative result limit: the UI loads
+    # more by requesting limit=15, then limit=30, and so on, with every
+    # response containing the previous prefix again. Treating that value as
+    # an offset appends duplicates and can still miss the tail. When the API
+    # advertises a total, request the bounded target once and replace the
+    # first-page prefix with the complete response.
+    if pag.style == "cumulative_limit":
+        if not result.total_count or result.total_count <= 0:
+            raise ValueError("cumulative_limit pagination requires a positive total count")
+        target = min(result.total_count, page_size * max_pages)
+        if target <= page_size:
+            return all_items
+
+        if pag.location == "query":
+            fetch_url = set_url_param(ex.url, pag.param_name, target)
+            fetch_body = ex.post_data
+        else:
+            fetch_url = ex.url
+            fetch_body = set_body_param(ex.post_data, pag.param_name, target)
+
+        data = await _fetch_page_with_retry(
+            fetch_fn,
+            ex.method,
+            fetch_url,
+            headers,
+            fetch_body,
+        )
+        items = extract_items(
+            data,
+            result.candidate.json_path,
+            require_object_items=require_object_items,
+        )
+        if len(items) < target:
+            log.warning(
+                "api_sniff.cumulative_limit_gap",
+                requested=target,
+                discovered=len(items),
+                total_count=result.total_count,
+            )
+        return [project(item) for item in items] if items else all_items
+
+    # Try to increase page size
+    size_info = detect_size_param(ex.url, ex.post_data)
+    if size_info and size_info[2] < _DESIRED_PAGE_SIZE:
+        sp_name, sp_loc, _sp_orig = size_info
+        probe_url = ex.url
+        probe_body = ex.post_data
+        if sp_loc == "query":
+            probe_url = set_url_param(probe_url, sp_name, _DESIRED_PAGE_SIZE)
+        else:
+            probe_body = set_body_param(probe_body, sp_name, _DESIRED_PAGE_SIZE)
+        if pag.location == "query":
+            probe_url = set_url_param(probe_url, pag.param_name, pag.start_value)
+        else:
+            probe_body = set_body_param(probe_body, pag.param_name, pag.start_value)
+
+        try:
+            data = await fetch_fn(ex.method, probe_url, headers, probe_body)
+            probe_items = extract_items(
+                data,
+                result.candidate.json_path,
+                require_object_items=require_object_items,
+            )
+            if len(probe_items) > page_size:
+                log.debug(
+                    "api_sniff.page_size_increased",
+                    old=page_size,
+                    new=len(probe_items),
+                )
+                page_size = len(probe_items)
+                all_items = [project(item) for item in probe_items]
+                ex = Exchange(
+                    method=ex.method,
+                    url=probe_url,
+                    request_headers=ex.request_headers,
+                    post_data=probe_body,
+                    status=ex.status,
+                    body=data,
+                    content_type=ex.content_type,
+                    phase=ex.phase,
+                )
+                new_total = find_total_count(data, result.candidate.json_path)
+                if new_total and new_total > page_size:
+                    result.total_count = new_total
+                if pag.style == "offset":
+                    pag.increment = page_size
+        except ApiSnifferItemValidationError:
+            raise
+        except Exception:
+            log.debug("api_sniff.page_size_probe_failed", exc_info=True)
+
+    # Calculate total pages
+    if result.total_count is not None and page_size > 0:
+        total_pages = min(
+            max(1, (result.total_count + page_size - 1) // page_size),
+            max_pages,
+        )
+    else:
+        total_pages = max_pages
+
+    if pag.style == "offset":
+        current_value = pag.start_value + pag.increment
+    else:
+        current_value = pag.start_value + pag.increment
+
+    pages_fetched = 1
+    empty_count = 0
+
+    while pages_fetched < total_pages:
+        if pag.location == "query":
+            fetch_url = set_url_param(ex.url, pag.param_name, current_value)
+            fetch_body = ex.post_data
+        else:
+            fetch_url = ex.url
+            fetch_body = set_body_param(ex.post_data, pag.param_name, current_value)
+
+        log.debug(
+            "api_sniff.paginate",
+            page=pages_fetched + 1,
+            param=pag.param_name,
+            value=current_value,
+        )
+
+        # Retry-then-raise around the fetch (#2733). Persistent transient
+        # failures previously fell through to ``except Exception: break``
+        # which silently truncated the result set — same shape as the
+        # NHS spike (#2722). Now they raise ``PaginationFetchError`` and
+        # the run is recorded as a failure end-to-end. End-of-pagination
+        # is still detected via the empty-page / partial-page branches
+        # below.
+        data = await _fetch_page_with_retry(fetch_fn, ex.method, fetch_url, headers, fetch_body)
+        items = extract_items(
+            data,
+            result.candidate.json_path,
+            require_object_items=require_object_items,
+        )
+
+        if not items:
+            empty_count += 1
+            if empty_count >= 2:
+                log.debug("api_sniff.pagination_stop", reason="empty_pages")
+                break
+        else:
+            empty_count = 0
+            all_items.extend(project(item) for item in items)
+            if len(items) < page_size and (
+                not result.total_count or len(all_items) >= result.total_count
+            ):
+                break
+
+        pages_fetched += 1
+        current_value += pag.increment
+
+    # Warn if pagination increment doesn't match actual page size
+    if (
+        pag.style == "offset"
+        and pag.increment > page_size
+        and (result.total_count is None or result.total_count > page_size)
+    ):
+        log.warning(
+            "api_sniff.page_size_mismatch",
+            configured_increment=pag.increment,
+            actual_page_size=page_size,
+            hint="API returned fewer items than pagination increment — jobs may be skipped. "
+            "Set increment to match the actual page size.",
+        )
+
+    # Warn if total count >> discovered count (pagination gap)
+    if result.total_count and len(all_items) < result.total_count * 0.8:
+        log.warning(
+            "api_sniff.pagination_gap",
+            total_count=result.total_count,
+            discovered=len(all_items),
+            hint="Discovered significantly fewer items than API total — "
+            "check pagination increment matches actual page size.",
+        )
+
+    return all_items
+
+
+async def extract_urls_via_dom_crossref(
+    page,
+    items: list[dict],
+    page_url: str,
+) -> list[str]:
+    """Cross-reference JSON item IDs with <a href> links on the page.
+
+    When API items have no URL field, find a DOM link that contains an item ID,
+    derive the URL template, then construct URLs for ALL items.
+    """
+    from src.shared.nextdata import resolve_path
+
+    if not items:
+        return []
+    sample = items[0]
+
+    id_field = None
+    for key in sample:
+        if ID_FIELDS.match(key):
+            id_field = key
+            break
+    if not id_field:
+        return []
+
+    item_ids = [str(it[id_field]) for it in items if id_field in it]
+    if not item_ids:
+        return []
+
+    dom_links: list[str] = await page.evaluate("""() => {
+        return [...document.querySelectorAll('a[href]')].map(a => a.href);
+    }""")
+
+    ref_link = None
+    ref_id = None
+    page_netloc = urlparse(page_url).netloc
+    for item_id in item_ids[:10]:
+        for href in dom_links:
+            if item_id in href and urlparse(href).netloc == page_netloc:
+                ref_link = href
+                ref_id = item_id
+                break
+        if ref_link:
+            break
+
+    if not ref_link:
+        return []
+
+    ref_parsed = urlparse(ref_link)
+    ref_path = ref_parsed.path
+    id_start = ref_path.find(ref_id)
+    if id_start < 0:
+        return []
+
+    prefix = ref_path[:id_start]
+    after_id = ref_path[id_start + len(ref_id) :]
+
+    ref_item = next((it for it in items if str(it.get(id_field)) == ref_id), None)
+    slug_field = None
+    if ref_item and after_id.startswith("/"):
+        slug_part = after_id[1:]
+        for key, val in ref_item.items():
+            if isinstance(val, str) and val and slug_part.startswith(val):
+                slug_field = key
+                break
+
+    ref_qparams = parse_qs(ref_parsed.query)
+    query_field_map: dict[str, str] = {}
+    if ref_item:
+        for qp, qvals in ref_qparams.items():
+            qval = qvals[0]
+            for key, val in ref_item.items():
+                if isinstance(val, str) and val == qval:
+                    query_field_map[qp] = key
+                elif isinstance(val, dict):
+                    for k2, v2 in val.items():
+                        if isinstance(v2, str) and v2 == qval:
+                            query_field_map[qp] = f"{key}.{k2}"
+
+    urls = []
+    for item in items:
+        item_id = str(item.get(id_field, ""))
+        if not item_id:
+            continue
+        path = f"{prefix}{item_id}"
+        if slug_field:
+            slug = str(item.get(slug_field, ""))
+            if slug:
+                path += f"/{slug}"
+        qparts = {}
+        for qp, field_path in query_field_map.items():
+            val = resolve_path(item, field_path)
+            if val is not None:
+                qparts[qp] = str(val)
+        full_url = urljoin(page_url, path)
+        if qparts:
+            full_url += "?" + urlencode(qparts)
+        urls.append(full_url)
+
+    return urls
+
+
+# ---------------------------------------------------------------------------
+# Page script scanning — discovers API URLs hidden in inline JS
+# ---------------------------------------------------------------------------
+
+# Patterns that suggest an API endpoint in JS source
+_SCRIPT_URL_RE = re.compile(
+    r"""(?:"""
+    # fetch("...") or fetch('...')
+    r"""fetch\s*\(\s*["']([^"']+)["']"""
+    r"""|"""
+    # $.ajax/get/post("...") or jQuery.ajax({url: "..."})
+    r"""\$\.(?:ajax|get|post|getJSON)\s*\(\s*["']([^"']+)["']"""
+    r"""|"""
+    # url: "..." inside ajax config objects
+    r"""url\s*:\s*["']([^"']+)["']"""
+    r""")""",
+    re.IGNORECASE,
+)
+
+# Simpler pattern for URL-like strings that contain job/career/API markers
+_API_URL_STRING_RE = re.compile(
+    r"""["']((?:https?://[^"'\s]+|/[^"'\s]+)"""
+    r"""(?:\.php|/api/|/wp-json/|/jobs|/careers|/positions|/openings|/vacancies)"""
+    r"""[^"'\s]*)["']""",
+    re.IGNORECASE,
+)
+
+# Noise patterns to filter out (analytics, CDN, etc.)
+_SCRIPT_URL_NOISE = re.compile(
+    r"google|analytics|facebook|sentry|segment|amplitude|mixpanel|hotjar"
+    r"|newrelic|cloudwatch|doubleclick|googlesyndication|googletagmanager"
+    r"|gtag|pixel|tracking|beacon|fonts\.|cdn\.|static\.|assets\.",
+    re.IGNORECASE,
+)
+
+
+async def scan_page_scripts(page) -> list[dict]:
+    """Scan inline ``<script>`` tags for API URL patterns.
+
+    Returns ``[{"url": ..., "context": ...}, ...]`` where *context* is the
+    matching source line (truncated) for human review.
+    """
+    scripts: list[str] = await page.evaluate("""() => {
+        return [...document.querySelectorAll('script:not([src])')].map(s => s.textContent);
+    }""")
+
+    seen: set[str] = set()
+    results: list[dict] = []
+
+    for script_text in scripts:
+        if not script_text or len(script_text) < 10:
+            continue
+
+        # Try explicit fetch/ajax patterns
+        for match in _SCRIPT_URL_RE.finditer(script_text):
+            url = match.group(1) or match.group(2) or match.group(3)
+            if not url or url in seen or _SCRIPT_URL_NOISE.search(url):
+                continue
+            seen.add(url)
+            start = max(0, match.start() - 20)
+            end = min(len(script_text), match.end() + 20)
+            context = script_text[start:end].replace("\n", " ").strip()
+            results.append({"url": url, "context": context[:120]})
+
+        # Try URL-like strings with job/API markers
+        for match in _API_URL_STRING_RE.finditer(script_text):
+            url = match.group(1)
+            if not url or url in seen or _SCRIPT_URL_NOISE.search(url):
+                continue
+            seen.add(url)
+            start = max(0, match.start() - 20)
+            end = min(len(script_text), match.end() + 20)
+            context = script_text[start:end].replace("\n", " ").strip()
+            results.append({"url": url, "context": context[:120]})
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# CMS detection — identifies WordPress and suggests candidate API endpoints
+# ---------------------------------------------------------------------------
+
+# WordPress markers in page HTML
+_WP_MARKERS = (
+    "wp-content",
+    "wp-includes",
+    "wp-json",
+    'name="generator" content="WordPress',
+)
+
+# Common WordPress job endpoint paths to probe
+_WP_CANDIDATE_PATHS = (
+    "/wp-json/wp/v2/jobs",
+    "/wp-json/wp/v2/job_listing",
+    "/wp-json/wp/v2/job-listings",
+    "/wp-json/wp/v2/job-listing?per_page=100",
+    "/wp-json/wp/v2/posts?categories=jobs",
+    "/wp-admin/admin-ajax.php?action=get_jobs",
+    "/wp-admin/admin-ajax.php?action=nopriv_get_job_listings",
+    "/get-jobs.php",
+)
+
+
+async def detect_cms(page) -> dict | None:
+    """Detect CMS type from page content.
+
+    Currently detects WordPress.  Returns ``{"cms": "wordpress",
+    "candidates": [...]}`` or ``None``.
+    """
+    try:
+        html = await page.content()
+    except Exception:
+        return None
+
+    html_lower = html.lower()
+    is_wp = any(marker.lower() in html_lower for marker in _WP_MARKERS)
+
+    if is_wp:
+        return {
+            "cms": "wordpress",
+            "candidates": list(_WP_CANDIDATE_PATHS),
+        }
+
+    return None

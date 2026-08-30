@@ -1,0 +1,11 @@
+# Normalise everything to LF — this repo runs on Linux CI.
+* text=auto eol=lf
+
+# Binary assets: never touch
+*.png binary
+*.webp binary
+*.jpg binary
+*.jpeg binary
+*.svg text eol=lf
+*.b64 binary
+*.descriptor binary

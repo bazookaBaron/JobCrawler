@@ -1,0 +1,233 @@
+"""Gem ATS Job Board API monitor.
+
+Public API:
+  GET https://api.gem.com/job_board/v0/{slug}/job_posts/
+
+Returns all published jobs in a single request — no pagination, no auth.
+"""
+
+from __future__ import annotations
+
+import re
+from urllib.parse import urlparse
+
+import httpx
+import structlog
+
+from src.core.enum_normalize import normalize_job_location_type
+from src.core.monitors import (
+    DiscoveredJob,
+    register,
+    slug_guess_allowed,
+)
+from src.core.monitors._ats_template import ProbeCount, ProbeResult, ats_can_handle
+from src.shared.truncation import truncated_rich_result
+
+log = structlog.get_logger()
+
+MAX_JOBS = 50_000
+
+_URL_PATTERN = re.compile(r"jobs\.gem\.com/([\w-]+)")
+_PAGE_PATTERNS = [_URL_PATTERN]
+
+_IGNORE_SLUGS = frozenset({"api", "www", "app", "docs", "help", "support"})
+
+# Gem snake_case codes (``full_time``/``part_time``/``contract``/
+# ``temporary``/``internship``/``volunteer``) pass through unchanged
+# — the central
+# :func:`src.core.enum_normalize.normalize_employment_type` handles
+# them.  ``location_type``
+# (``remote``/``hybrid``/``in_office``/``on_site``/``onsite``) is
+# funnelled through
+# :func:`src.core.enum_normalize.normalize_job_location_type`.
+
+
+def _slug_from_url(url: str) -> str | None:
+    """Extract the Gem board slug from a jobs.gem.com URL."""
+    match = _URL_PATTERN.search(url)
+    if match:
+        slug = match.group(1)
+        if slug not in _IGNORE_SLUGS:
+            return slug
+    return None
+
+
+def _api_url(slug: str) -> str:
+    return f"https://api.gem.com/job_board/v0/{slug}/job_posts/"
+
+
+def _parse_locations(post: dict) -> list[str] | None:
+    """Extract locations from offices array, falling back to location.name."""
+    locations: list[str] = []
+    seen: set[str] = set()
+
+    offices = post.get("offices")
+    if offices and isinstance(offices, list):
+        for office in offices:
+            loc = office.get("location")
+            name = loc.get("name") if isinstance(loc, dict) else None
+            if not name:
+                name = office.get("name")
+            if name and name not in seen:
+                locations.append(name)
+                seen.add(name)
+
+    if not locations:
+        loc = post.get("location")
+        if isinstance(loc, dict):
+            name = loc.get("name")
+            if name:
+                locations.append(name)
+        elif isinstance(loc, str) and loc:
+            locations.append(loc)
+
+    return locations or None
+
+
+def _parse_job(post: dict) -> DiscoveredJob | None:
+    """Map a Gem API job post to a DiscoveredJob."""
+    url = post.get("absolute_url")
+    if not url:
+        return None
+
+    # Employment type — pass through raw upstream value.
+    employment_type = post.get("employment_type") or None
+
+    # Location type
+    raw_loc_type = post.get("location_type") or ""
+    job_location_type = normalize_job_location_type(raw_loc_type, default=None)
+
+    # Metadata
+    metadata: dict = {}
+    departments = post.get("departments")
+    if departments and isinstance(departments, list):
+        dept_names = [d["name"] for d in departments if isinstance(d, dict) and d.get("name")]
+        if dept_names:
+            metadata["department"] = ", ".join(dept_names)
+
+    return DiscoveredJob(
+        url=url,
+        title=post.get("title"),
+        description=post.get("content"),
+        locations=_parse_locations(post),
+        employment_type=employment_type,
+        job_location_type=job_location_type,
+        date_posted=post.get("first_published_at"),
+        metadata=metadata or None,
+    )
+
+
+async def discover(board: dict, client: httpx.AsyncClient, pw=None) -> list[DiscoveredJob]:
+    """Fetch job listings from the Gem public API."""
+    metadata = board.get("metadata") or {}
+    slug = metadata.get("token") or _slug_from_url(board["board_url"])
+
+    if not slug:
+        raise ValueError(
+            f"Cannot derive Gem slug from board URL {board['board_url']!r} and no token in metadata"
+        )
+
+    url = _api_url(slug)
+    response = await client.get(url, follow_redirects=True)
+    response.raise_for_status()
+
+    posts = response.json()
+    if not isinstance(posts, list):
+        log.warning("gem.unexpected_response", slug=slug, type=type(posts).__name__)
+        return []
+
+    jobs: list[DiscoveredJob] = []
+    for post in posts:
+        parsed = _parse_job(post)
+        if parsed:
+            jobs.append(parsed)
+
+    if len(jobs) > MAX_JOBS:
+        log.warning("gem.truncated", slug=slug, total=len(jobs), cap=MAX_JOBS)
+        return truncated_rich_result(jobs)
+
+    return jobs
+
+
+async def _probe_api(slug: str, client: httpx.AsyncClient) -> tuple[bool, int | None]:
+    """Probe the Gem API for a slug. Returns (found, job_count)."""
+    try:
+        resp = await client.get(_api_url(slug), follow_redirects=True)
+        if resp.status_code != 200:
+            return False, None
+        data = resp.json()
+        if isinstance(data, list):
+            return True, len(data)
+        return False, None
+    except Exception:
+        return False, None
+
+
+async def _fetch_job_count(
+    slug: str,
+    client: httpx.AsyncClient,
+    context: None,
+) -> ProbeCount | None:
+    _ = context
+    found, count = await _probe_api(slug, client)
+    if found:
+        return count
+    return None
+
+
+async def _probe_template_slug(
+    slug: str,
+    client: httpx.AsyncClient,
+    context: None,
+) -> ProbeResult:
+    _ = context
+    return await _probe_api(slug, client)
+
+
+def _tracking_context_candidates(url: str, html: str, context: None) -> tuple[str, ...]:
+    _ = context
+    if "__GEM_TRACKING_CONTEXT__" not in html:
+        return ()
+
+    parsed = urlparse(url)
+    path_parts = (parsed.path or "").strip("/").split("/")
+    if not path_parts or not path_parts[0]:
+        return ()
+
+    candidate = path_parts[0]
+    if candidate in _IGNORE_SLUGS:
+        return ()
+    return (candidate,)
+
+
+def _token_result(slug: str, count: ProbeCount | None, context: None) -> dict:
+    _ = context
+    result: dict = {"token": slug}
+    if count is not None:
+        result["jobs"] = count
+    return result
+
+
+async def can_handle(url: str, client: httpx.AsyncClient | None = None, pw=None) -> dict | None:
+    """Detect Gem: URL pattern -> page HTML scan -> slug-based API probe."""
+    _ = pw
+    return await ats_can_handle(
+        url,
+        client,
+        monitor_name="gem",
+        token_from_url=_slug_from_url,
+        page_patterns=_PAGE_PATTERNS,
+        ignore_tokens=_IGNORE_SLUGS,
+        fetch_job_count=_fetch_job_count,
+        api_probe=_probe_template_slug,
+        initial_context=None,
+        result_builder=_token_result,
+        page_token_probe=_probe_template_slug,
+        extra_probe_tokens=_tracking_context_candidates,
+        extra_probe_log_event="gem.detected_tracking_context",
+        allow_slug_guess=slug_guess_allowed(),
+        log_token_field="slug",
+    )
+
+
+register("gem", discover, cost=10, can_handle=can_handle, rich=True)

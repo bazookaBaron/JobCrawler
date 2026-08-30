@@ -1,0 +1,11 @@
+--- C:/Users/debna/AppData/Local/Temp/jobseek-src/apps/crawler/pyproject.toml	2026-08-30 18:17:51.724748400 +0530
++++ crawler/pyproject.toml	2026-08-30 19:18:10.240679900 +0530
+@@ -42,6 +42,8 @@
+ crawler = "src.cli:main"
+ ws = "src.workspace.cli:main"
+ labeller = "src.labeller.cli:main"
++# job-crawler fork: Redis-free, single-process Postgres pipeline (src/pgpipe/).
++jobs = "src.pgpipe.cli:main"
+ 
+ [project.optional-dependencies]
+ enrich = ["openai>=2.53.0", "anthropic>=0.122.0", "google-genai>=2.17.0"]

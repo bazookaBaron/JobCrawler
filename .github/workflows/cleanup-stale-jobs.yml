@@ -1,0 +1,59 @@
+name: cleanup-stale-jobs
+
+# Daily hard delete: remove postings not seen live in 5+ days. FK cascades from
+# crawler.job_posting are limited to nothing downstream (queue/board reference
+# boards, not postings), so this is a plain DELETE. `crawl-jobs` already marks
+# postings closed at 3 days; this is the final GC + a safety net if the crawl
+# workflow is paused.
+on:
+  schedule:
+    - cron: "17 4 * * *"      # 04:17 UTC daily, offset from the 6h crawl cron
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: crawler
+    env:
+      LOCAL_DATABASE_URL: ${{ secrets.LOCAL_DATABASE_URL }}
+      PGPIPE_SCHEMA: crawler
+      DELETE_AFTER_DAYS: "5"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv + Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies (locked)
+        run: uv sync --frozen
+
+      - name: Hard-delete postings not seen in ${{ env.DELETE_AFTER_DAYS }} days
+        run: |
+          set -euo pipefail
+          uv run --no-sync jobs hard-delete --days "${DELETE_AFTER_DAYS}" | tee ../delete.json
+          uv run --no-sync jobs prune | tee -a ../delete.json
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## cleanup-stale-jobs"
+            echo '```json'; cat ../delete.json 2>/dev/null || echo '{}'; echo '```'
+            echo '### db stats'
+            echo '```json'
+            uv run --no-sync jobs stats 2>&1 || echo '{"stats":"unavailable"}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
