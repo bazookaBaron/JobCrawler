@@ -1,12 +1,17 @@
 """`jobs` CLI — Postgres-only, Redis-free crawl pipeline.
 
-    jobs migrate                 apply the compact schema (idempotent)
+    jobs migrate                 apply the compact schema + jobs_analytics() (idempotent)
+    jobs purge                   TRUNCATE job_posting + reset crawl_queue (clean re-scrape)
     jobs sync                    data/*.csv -> <schema>.company / job_board
-    jobs run [--minutes N]       one bounded crawl pass (default 20)
+    jobs run [--minutes N]       one bounded crawl pass (default 20): reclaim ->
+                                 enqueue -> crawl (tech-filter + seniority-tag) ->
+                                 close-stale -> prune
     jobs close-stale [--days N]  status='closed' for postings unseen N days (def 3)
     jobs prune [--cap N]         keep newest N postings per company (def 400)
     jobs hard-delete [--days N]  DELETE postings unseen N days (def 5)
     jobs stats                   row counts
+
+Clean re-scrape:  jobs migrate && jobs purge && jobs sync && jobs run --minutes 20
 
 Entry point: `jobs = "src.pgpipe.cli:main"` in pyproject.toml.
 """
@@ -32,6 +37,22 @@ async def _cmd_migrate() -> int:
     try:
         await apply_schema(pool)
         _p({"migrate": "ok", "schema": settings.validated_schema()})
+    finally:
+        await pool.close()
+    return 0
+
+
+async def _cmd_purge() -> int:
+    """Wipe all postings + queue for a clean re-scrape. Boards/companies stay."""
+    schema = settings.validated_schema()
+    pool = await connect()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f'TRUNCATE {schema}.job_posting RESTART IDENTITY;'
+                f'TRUNCATE {schema}.crawl_queue RESTART IDENTITY;'
+            )
+        _p({"purge": "ok", "truncated": ["job_posting", "crawl_queue"]})
     finally:
         await pool.close()
     return 0
@@ -124,6 +145,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(prog="jobs", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("migrate")
+    sub.add_parser("purge")
     sub.add_parser("sync")
     rp = sub.add_parser("run")
     rp.add_argument("--minutes", type=float, default=20.0)
@@ -138,6 +160,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.cmd == "migrate":
         rc = asyncio.run(_cmd_migrate())
+    elif args.cmd == "purge":
+        rc = asyncio.run(_cmd_purge())
     elif args.cmd == "sync":
         rc = asyncio.run(_cmd_sync())
     elif args.cmd == "run":

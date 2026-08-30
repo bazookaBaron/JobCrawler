@@ -127,9 +127,15 @@ def monitor_needs_browser(name: str, cfg: dict) -> bool:
     return False
 
 
+# Monitors this fork can ingest as full rows: upstream's rich set PLUS
+# 'workday' — jobseek's workday monitor is URL-only, but src/pgpipe/
+# monitors_workday.py hits the Workday CXS API directly and returns full rows.
+LOCAL_RICH = RICH_MONITORS | {"workday"}
+
+
 def board_is_http_rich(row: dict) -> bool:
     mt = row["monitor_type"]
-    return mt in RICH_MONITORS and not monitor_needs_browser(mt, _cfg(row.get("monitor_config")))
+    return mt in LOCAL_RICH and not monitor_needs_browser(mt, _cfg(row.get("monitor_config")))
 
 
 def main() -> None:

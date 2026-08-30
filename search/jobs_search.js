@@ -3,8 +3,9 @@
 // ===========================================================================
 //   npm i pg
 //
-// One-time setup: `jobs migrate` creates crawler.job_posting + its generated
-// search_tsv column + GIN index. Then apply search/jobs_search.sql once to add
+// One-time setup: `jobs migrate` creates crawler.job_posting (incl. the
+// seniority column + generated search_tsv + GIN index) and the
+// crawler.jobs_analytics() RPC. Then apply search/jobs_search.sql once to add
 // the crawler.search_jobs() / list_jobs() / job_counts_by_company() functions.
 //
 // Every function takes `db` = a pg.Pool or pg.Client (anything with
@@ -22,6 +23,7 @@
  * @param {string} [opts.q]              natural-language query
  * @param {string[]} [opts.companies]    company slugs
  * @param {string[]} [opts.locationTypes] "remote" | "hybrid" | "onsite"
+ * @param {string[]} [opts.seniorities]  intern|junior|mid|senior|staff|principal|unknown
  * @param {'open'|'closed'|'any'} [opts.status='open']
  * @param {number} [opts.limit=20]
  * @param {number} [opts.offset=0]
@@ -30,7 +32,7 @@
  */
 async function searchJobs(db, opts = {}) {
   const {
-    q = null, companies = null, locationTypes = null,
+    q = null, companies = null, locationTypes = null, seniorities = null,
     status = 'open', limit = 20, offset = 0,
   } = opts;
 
@@ -38,9 +40,9 @@ async function searchJobs(db, opts = {}) {
   const safeOffset = clampInt(offset, 0, 1_000_000, 0);
 
   const { rows } = await db.query(
-    'SELECT * FROM crawler.search_jobs($1, $2, $3, $4, $5, $6)',
+    'SELECT * FROM crawler.search_jobs($1, $2, $3, $4, $5, $6, $7)',
     [emptyToNull(q), nullIfEmpty(companies), nullIfEmpty(locationTypes),
-     status, safeLimit, safeOffset],
+     nullIfEmpty(seniorities), status, safeLimit, safeOffset],
   );
 
   const total = rows.length ? Number(rows[0].total_count) : 0;
@@ -55,6 +57,7 @@ async function searchJobs(db, opts = {}) {
  * @param {object} opts
  * @param {string[]} [opts.companies]
  * @param {string[]} [opts.locationTypes]
+ * @param {string[]} [opts.seniorities]
  * @param {'open'|'closed'|'any'} [opts.status='open']
  * @param {{first_seen_at: string, id: number}} [opts.after]
  * @param {number} [opts.limit=20]
@@ -62,14 +65,14 @@ async function searchJobs(db, opts = {}) {
  */
 async function listJobs(db, opts = {}) {
   const {
-    companies = null, locationTypes = null, status = 'open',
+    companies = null, locationTypes = null, seniorities = null, status = 'open',
     after = null, limit = 20,
   } = opts;
   const safeLimit = clampInt(limit, 1, 100, 20);
 
   const { rows } = await db.query(
-    'SELECT * FROM crawler.list_jobs($1, $2, $3, $4, $5, $6)',
-    [nullIfEmpty(companies), nullIfEmpty(locationTypes), status,
+    'SELECT * FROM crawler.list_jobs($1, $2, $3, $4, $5, $6, $7)',
+    [nullIfEmpty(companies), nullIfEmpty(locationTypes), nullIfEmpty(seniorities), status,
      after ? after.first_seen_at : null, after ? after.id : null, safeLimit],
   );
 
@@ -85,6 +88,17 @@ async function jobCountsByCompany(db, status = 'open') {
   return rows;
 }
 
+/**
+ * The webapp analytics-tab payload (one JSON object). Wraps
+ * crawler.jobs_analytics(). See src/pgpipe/schema.sql for the exact shape:
+ * { total, companies_with_jobs, by_seniority[], by_work_type[], by_source[],
+ *   top_companies[], posted_by_day[], mid_share_pct }
+ */
+async function jobsAnalytics(db) {
+  const { rows } = await db.query('SELECT crawler.jobs_analytics() AS a');
+  return rows[0].a;
+}
+
 // --- helpers -------------------------------------------------------------
 function emptyToNull(s) {
   return s == null || String(s).trim() === '' ? null : String(s);
@@ -97,7 +111,7 @@ function clampInt(v, lo, hi, dflt) {
   return Number.isNaN(n) ? dflt : Math.min(hi, Math.max(lo, n));
 }
 
-module.exports = { searchJobs, listJobs, jobCountsByCompany };
+module.exports = { searchJobs, listJobs, jobCountsByCompany, jobsAnalytics };
 
 // ===========================================================================
 // Example — node-postgres
@@ -119,7 +133,11 @@ module.exports = { searchJobs, listJobs, jobCountsByCompany };
 // const supabase = createClient(URL, SERVICE_ROLE_KEY, { db: { schema: 'crawler' } });
 // const { data } = await supabase.rpc('search_jobs', {
 //   p_query: 'machine learning', p_company: ['anthropic', 'openai'],
-//   p_location: null, p_status: 'open', p_limit: 20, p_offset: 0,
+//   p_location: null, p_seniority: ['senior', 'staff'],
+//   p_status: 'open', p_limit: 20, p_offset: 0,
 // });
 // // data[0].total_count = pre-pagination total.
+//
+// // analytics tab:
+// const { data: a } = await supabase.rpc('jobs_analytics');   // one JSON object
 // ===========================================================================

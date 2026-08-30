@@ -34,9 +34,25 @@ uv run --no-sync jobs migrate
 ```
 
 Creates schema **`crawler`** and its tables (`company`, `job_board`,
-`crawl_queue`, `job_posting`, `crawl_run`) + the `job_posting.search_tsv`
-generated column and GIN index. Idempotent — safe to re-run. Nothing is
-created in `public`, so it cannot collide with the webapp's tables.
+`crawl_queue`, `job_posting`, `crawl_run`) + the `job_posting.seniority`
+column, the `search_tsv` generated column + GIN index, the
+`crawler.jobs_analytics()` RPC, and `GRANT … TO service_role`. Idempotent —
+safe to re-run. Nothing is created in `public`, so it cannot collide with the
+webapp's tables.
+
+> For the webapp's `supabaseAdmin.schema('crawler').rpc('jobs_analytics')` to
+> resolve, add **`crawler`** under Supabase → Settings → API → *Exposed schemas*.
+
+### 2b. Clean re-scrape
+
+`jobs run` only *upserts* (it never deletes rows that stopped matching a
+filter). To rebuild the table tech-only from scratch:
+
+```bash
+uv run --no-sync jobs purge      # TRUNCATE crawler.job_posting + reset crawl_queue
+```
+
+Full clean cycle: `jobs migrate && jobs purge && jobs sync && jobs run --minutes 20`.
 
 > Optional sanity check that nothing in `public` clashes:
 > ```sql
@@ -66,17 +82,20 @@ uv run --no-sync jobs run --minutes 20
 
 What it does, in order: reclaim `claimed` queue rows older than 30 min →
 enqueue every enabled board → up to `PGPIPE_CONCURRENCY` (12) workers
-`claim (FOR UPDATE SKIP LOCKED)` + fetch + upsert → `close-stale` (3 d) →
+`claim (FOR UPDATE SKIP LOCKED)` + fetch → **tech-filter** (`PGPIPE_TECH_ONLY`,
+default on) → **seniority-tag** → upsert → `close-stale` (3 d) →
 `prune` (400/company) → write a `crawl_run` row. Prints a JSON summary:
 
 ```json
-{"boards_ok": 470, "boards_failed": 46, "postings_upserted": 38000,
- "postings_closed": 0, "postings_pruned": 0, "boards_remaining_pending": 0, ...}
+{"boards_ok": 511, "boards_failed": 15, "postings_upserted": 15434,
+ "postings_dropped_nontech": 55781, "postings_pruned": 4367,
+ "boards_remaining_pending": 0, "elapsed_s": 450.3, ...}
 ```
 
-~516 rich boards at concurrency 12 with ATS politeness (~0.6 s/shared host)
-is roughly **5-12 min**; 20 min is comfortable headroom. Re-run any time —
-it is incremental (upsert on `(company_slug, url)`, `last_seen_at` bumped).
+(Real numbers from the first live run: 516 boards, ~7.5 min, ~22 % of fetched
+postings kept as tech roles.) Re-run any time — it is incremental (upsert on
+`(company_slug, url)`, `last_seen_at` bumped). `crawl_run.notes` records the
+kept/dropped split.
 
 ---
 
@@ -88,11 +107,22 @@ uv run --no-sync jobs stats
 
 ```sql
 -- newest 10 jobs
-SELECT company_slug, title, location, location_type, url, source,
+SELECT company_slug, title, seniority, location, location_type, url, source,
        first_seen_at, last_seen_at, status
 FROM crawler.job_posting
 ORDER BY first_seen_at DESC
 LIMIT 10;
+
+-- seniority distribution
+SELECT seniority, count(*) FROM crawler.job_posting
+WHERE status='open' GROUP BY 1 ORDER BY 2 DESC;
+
+-- the whole analytics-tab payload
+SELECT crawler.jobs_analytics();
+
+-- workday roles
+SELECT company_slug, title, location, url FROM crawler.job_posting
+WHERE source='workday' ORDER BY first_seen_at DESC LIMIT 10;
 
 -- per-company counts
 SELECT company_slug, count(*) FROM crawler.job_posting

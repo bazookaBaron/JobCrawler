@@ -33,12 +33,13 @@ async def _worker(
         qid, attempts, slug = row["queue_id"], row["attempts"], row["board_slug"]
         try:
             async with pol.slot(row["board_url"]):
-                n = await asyncio.wait_for(
+                res = await asyncio.wait_for(
                     crawl_board(pool, row, http), timeout=settings.board_timeout_seconds
                 )
             await queue.finish_ok(pool, qid)
             stats["ok"] += 1
-            stats["upserted"] += n
+            stats["upserted"] += res["upserted"]
+            stats["dropped_nontech"] += res["dropped_nontech"]
         except Exception as exc:  # noqa: BLE001 - queue records + retries
             msg = f"{type(exc).__name__}: {exc}"
             await record_board_failure(pool, slug, msg)
@@ -59,7 +60,7 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
     enqueued = await queue.enqueue_due(pool)
     pending = await pool.fetchval("SELECT count(*) FROM crawl_queue WHERE status='pending'")
 
-    stats = {"ok": 0, "failed": 0, "upserted": 0, "errors": []}
+    stats = {"ok": 0, "failed": 0, "upserted": 0, "dropped_nontech": 0, "errors": []}
     pol = Politeness()
     http = make_client()
     try:
@@ -76,6 +77,14 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
     closed = await cleanup.close_stale(pool)
     pruned = await cleanup.prune_per_company(pool)
 
+    kept = stats["upserted"]
+    dropped = stats["dropped_nontech"]
+    seen = kept + dropped
+    notes = (
+        f"reclaimed={reclaimed} enqueued={enqueued} remaining_pending={remaining} "
+        f"tech_filter: kept={kept} dropped_nontech={dropped} "
+        f"({round(100.0 * kept / seen, 1) if seen else 0.0}% kept of {seen} seen)"
+    )
     await pool.execute(
         """
         UPDATE crawl_run SET finished_at = now(),
@@ -91,7 +100,7 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
         stats["upserted"],
         closed,
         pruned,
-        f"reclaimed={reclaimed} enqueued={enqueued} remaining_pending={remaining}",
+        notes,
     )
 
     return {
@@ -104,6 +113,7 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
         "boards_failed": stats["failed"],
         "boards_remaining_pending": int(remaining or 0),
         "postings_upserted": stats["upserted"],
+        "postings_dropped_nontech": dropped,
         "postings_closed": closed,
         "postings_pruned": pruned,
         "errors": stats["errors"],

@@ -12,9 +12,14 @@ A trimmed, **$0-budget** job-posting crawler, adapted from the crawler of
   **`crawler`** schema so it never collides with the webapp tables.
 - **Scope** — ~500 well-known companies (backend/distributed-systems, fintech,
   quant, GenAI, infra, security), ~516 boards, **rich HTTP monitors only**
-  (Greenhouse, Ashby, Lever, Recruitee, Gem, Oracle HCM, Amazon…). No browser,
-  no scrapers, **no job descriptions stored**.
-- **Search** — Postgres full-text search (`search/jobs_search.sql`). No Typesense.
+  (Greenhouse, Ashby, Lever, Recruitee, Gem, Oracle HCM, Amazon, **Workday** via
+  a compact CXS-API monitor). No browser, no scrapers, **no descriptions stored**.
+- **Tech-only** — a title/department filter (`PGPIPE_TECH_ONLY`, default on)
+  keeps engineering / applied-science / quant-dev roles and drops the rest.
+  Every posting is tagged with a `seniority` bucket
+  (intern/junior/mid/senior/staff/principal/unknown).
+- **Search + analytics** — Postgres FTS (`search/jobs_search.sql`) and a
+  `crawler.jobs_analytics()` RPC for the webapp analytics tab. No Typesense.
 
 Nothing here touches the `resume-optimizer` repo.
 
@@ -47,7 +52,8 @@ job-crawler/
 ## The `jobs` CLI
 
 ```
-uv run --no-sync jobs migrate                  apply the crawler schema (idempotent)
+uv run --no-sync jobs migrate                  schema + seniority col + jobs_analytics() (idempotent)
+uv run --no-sync jobs purge                    TRUNCATE job_posting + reset crawl_queue (clean re-scrape)
 uv run --no-sync jobs sync                     data/*.csv -> crawler.company / job_board
 uv run --no-sync jobs run [--minutes 20]       one bounded crawl pass
 uv run --no-sync jobs close-stale [--days 3]   status='closed' for postings unseen N days
@@ -57,7 +63,8 @@ uv run --no-sync jobs stats                    row counts
 ```
 
 `jobs run` = reclaim stale claims → enqueue every enabled board → N workers
-claim + fetch + upsert → close-stale → prune. See `RUN_LOCAL.md`.
+claim + fetch + **tech-filter + seniority-tag** + upsert → close-stale → prune.
+Clean re-scrape: `jobs migrate && jobs purge && jobs sync && jobs run`. See `RUN_LOCAL.md`.
 
 ---
 

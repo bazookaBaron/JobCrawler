@@ -1,6 +1,6 @@
-"""Crawl one board: call the jobseek monitor's discover() directly, map each
-DiscoveredJob to a compact row, upsert. No scraper, no description fetch,
-no R2, no enrichment, no Redis.
+"""Crawl one board: call the monitor's discover() directly, map each
+DiscoveredJob to a compact row, tech-filter, seniority-tag, upsert.
+No scraper, no description fetch, no R2, no enrichment, no Redis.
 """
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ import asyncpg
 import httpx
 
 from src.core.monitors import BoardGoneError, DiscoveredJob, get_discoverer
+from src.pgpipe.monitors_workday import discover_workday
+from src.pgpipe.seniority import seniority_of
+from src.pgpipe.tech_filter import TECH_ONLY, is_tech_role
 
 _EMPLOYMENT_MAP = {
     "full-time": "full_time", "fulltime": "full_time", "full time": "full_time",
@@ -80,6 +83,7 @@ def _to_record(company_slug: str, board_slug: str, source: str, job: DiscoveredJ
         _norm_employment(job.employment_type),
         _department(job),
         (job.date_posted or None),
+        seniority_of(_first(titles)),
     )
 
 
@@ -87,8 +91,8 @@ _UPSERT = """
 INSERT INTO job_posting
     (company_slug, board_slug, source, external_id, url, title, titles,
      location, locations, location_type, employment_type, department, date_posted,
-     first_seen_at, last_seen_at, status)
-VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10,$11,$12,$13, now(), now(), 'open')
+     seniority, first_seen_at, last_seen_at, status)
+VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10,$11,$12,$13,$14, now(), now(), 'open')
 ON CONFLICT (company_slug, url) DO UPDATE SET
     board_slug      = EXCLUDED.board_slug,
     source          = EXCLUDED.source,
@@ -101,15 +105,26 @@ ON CONFLICT (company_slug, url) DO UPDATE SET
     employment_type = EXCLUDED.employment_type,
     department      = EXCLUDED.department,
     date_posted     = EXCLUDED.date_posted,
+    seniority       = EXCLUDED.seniority,
     last_seen_at    = now(),
     status          = 'open'
 """
 
 
-async def crawl_board(pool: asyncpg.Pool, board: asyncpg.Record, http: httpx.AsyncClient) -> int:
-    """Fetch + upsert one board. Returns #postings upserted. Raises on failure
-    (caller records the error + retries via the queue). BoardGoneError disables
-    the board."""
+async def _discover(monitor_type: str, board_dict: dict, http: httpx.AsyncClient):
+    # Compact rich Workday monitor (src/pgpipe/monitors_workday.py) — NOT
+    # jobseek's URL-only src/core/monitors/workday.py.
+    if monitor_type == "workday":
+        return await discover_workday(board_dict, http)
+    return await get_discoverer(monitor_type)(board_dict, http)
+
+
+async def crawl_board(
+    pool: asyncpg.Pool, board: asyncpg.Record, http: httpx.AsyncClient
+) -> dict[str, int]:
+    """Fetch + upsert one board. Returns {"upserted", "dropped_nontech"}.
+    Raises on failure (caller records + retries via the queue).
+    BoardGoneError disables the board."""
     monitor_type = board["monitor_type"]
     cfg = board["monitor_config"]
     if isinstance(cfg, str):
@@ -121,9 +136,8 @@ async def crawl_board(pool: asyncpg.Pool, board: asyncpg.Record, http: httpx.Asy
         "company_slug": board["company_slug"],
     }
 
-    discover = get_discoverer(monitor_type)
     try:
-        result = await discover(board_dict, http)
+        result = await _discover(monitor_type, board_dict, http)
     except BoardGoneError as gone:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -131,15 +145,19 @@ async def crawl_board(pool: asyncpg.Pool, board: asyncpg.Record, http: httpx.Asy
                 "last_attempt_at=now(), updated_at=now() WHERE board_slug=$1",
                 board["board_slug"], f"gone: {gone}",
             )
-        return 0
+        return {"upserted": 0, "dropped_nontech": 0}
 
     jobs = _rows_from_result(result)
-    records = [
-        r for r in (
-            _to_record(board["company_slug"], board["board_slug"], monitor_type, j)
-            for j in jobs
-        ) if r is not None
-    ]
+    records: list[tuple] = []
+    dropped = 0
+    for j in jobs:
+        rec = _to_record(board["company_slug"], board["board_slug"], monitor_type, j)
+        if rec is None:
+            continue
+        if TECH_ONLY and not is_tech_role(rec[5], rec[11]):  # rec[5]=title, rec[11]=department
+            dropped += 1
+            continue
+        records.append(rec)
 
     async with pool.acquire() as conn, conn.transaction():
         if records:
@@ -154,7 +172,7 @@ async def crawl_board(pool: asyncpg.Pool, board: asyncpg.Record, http: httpx.Asy
             """,
             board["board_slug"], len(records),
         )
-    return len(records)
+    return {"upserted": len(records), "dropped_nontech": dropped}
 
 
 async def record_board_failure(pool: asyncpg.Pool, board_slug: str, err: str) -> None:

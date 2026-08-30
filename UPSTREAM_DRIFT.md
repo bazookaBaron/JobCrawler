@@ -22,20 +22,68 @@ is bypassed by a new single-process package, **`src/pgpipe/`**.
 
 | file | purpose |
 |---|---|
-| `cli.py` | `jobs` entrypoint: `migrate / sync / run / close-stale / prune / hard-delete / stats` |
+| `cli.py` | `jobs` entrypoint: `migrate / purge / sync / run / close-stale / prune / hard-delete / stats` |
 | `config.py` | env-only settings (`LOCAL_DATABASE_URL`, `PGPIPE_*`). No pydantic, no Redis. |
 | `db.py` | asyncpg pool; `search_path = <schema>,public`; applies `schema.sql` |
-| `schema.sql` | compact schema in a **dedicated `crawler` Postgres schema** (idempotent) |
+| `schema.sql` | compact schema in a **dedicated `crawler` Postgres schema** (idempotent); `seniority` column; `jobs_analytics()` RPC; `service_role` grants |
 | `csv_sync.py` | `data/*.csv` → `crawler.company` / `crawler.job_board` |
 | `queue.py` | `crawler.crawl_queue` — `SELECT … FOR UPDATE SKIP LOCKED`, 30-min stale-claim reclaim |
 | `throttle.py` | in-process per-host politeness gate + global semaphore (replaces `redis_capacity.py`) |
 | `http.py` | plain `httpx.AsyncClient` (browser-ish UA); skips `src.shared.http` proxy/SSRF stack |
-| `ingest.py` | call `get_discoverer(monitor_type)(board, http)` → map `DiscoveredJob` → compact upsert |
-| `runner.py` | orchestrates `run`: reclaim → enqueue → N workers → close-stale → prune → `crawl_run` row |
+| `tech_filter.py` | `is_tech_role(title, department)` — ALLOW/BLOCK regex lists; `PGPIPE_TECH_ONLY` (default 1) |
+| `seniority.py` | `seniority_of(title)` → intern/junior/mid/senior/staff/principal/unknown |
+| `monitors_workday.py` | compact **rich** Workday CXS-API monitor (jobseek's is URL-only) |
+| `ingest.py` | dispatch monitor (incl. Workday) → map `DiscoveredJob` → tech-filter → seniority-tag → compact upsert |
+| `runner.py` | orchestrates `run`: reclaim → enqueue → N workers → close-stale → prune → `crawl_run` row (with kept/dropped counts in `notes`) |
 
 `jobs` is registered in `pyproject.toml [project.scripts]` (see
 `patches/02-*.diff`). `uv.lock` is unchanged (no new dependencies —
 `asyncpg`, `httpx`, `python-dotenv` were already there).
+
+---
+
+## 1b. Round-2 additions (tech filter, seniority, Workday, analytics RPC)
+
+- **Tech-only filter** — `src/pgpipe/tech_filter.py::is_tech_role(title, department)`.
+  ALLOW list (software engineer, sde/swe, backend/frontend/full-stack, sre,
+  data/ml/security engineer, applied/research scientist, quant developer, …)
+  and a BLOCK list that wins even on an ALLOW match (sales/solutions/support
+  engineer, account, recruit, marketing, financial, collections, relationship
+  manager, branch). Applied in `ingest.crawl_board` **before upsert** when
+  `PGPIPE_TECH_ONLY` ≠ 0 (default on). Per-run kept/dropped counts go into
+  `crawl_run.notes` and the `jobs run` JSON (`postings_dropped_nontech`).
+- **`seniority` column** on `crawler.job_posting` (`text NOT NULL DEFAULT
+  'unknown'`, indexed). Derived at ingest by `src/pgpipe/seniority.py::
+  seniority_of(title)` — most-specific-first so "Senior Staff Engineer" →
+  `principal`, "New Grad SWE Intern" → `intern`. A bare "Software Engineer"
+  with no level cue → `unknown` (per the spec's `else unknown`).
+- **Workday** — `src/pgpipe/monitors_workday.py`. jobseek's
+  `src/core/monitors/workday.py` is URL-only (needs a scraper); this hits the
+  Workday CXS search API directly
+  (`POST …/wday/cxs/{tenant}/{site}/jobs`, paginate by 20 to `total`, cap
+  2000) and returns full `DiscoveredJob` rows with `source='workday'`.
+  `ingest._discover` routes `monitor_type == 'workday'` here.
+  `tools/trim_csvs.py` adds `workday` to the eligible monitor set
+  (`LOCAL_RICH`), so the trimmed CSVs now include 27 Workday boards
+  (nvidia, crowdstrike, snyk, checkout-com, g-research, paypal, adobe, …).
+  `_cfg` resolves tenant/dc/site from any of jobseek's config key spellings
+  (`company`/`tenant`, `wd_instance`/`dc`, `site`/`board`/`site_id`/…) and
+  falls back to parsing the `board_url`.
+- **`jobs purge`** — `TRUNCATE crawler.job_posting RESTART IDENTITY` +
+  `TRUNCATE crawler.crawl_queue RESTART IDENTITY` for a clean re-scrape.
+  Companies/boards are untouched.
+- **`crawler.jobs_analytics()`** — STABLE SQL function in `schema.sql`
+  returning one JSON object for the webapp analytics tab
+  (`total`, `companies_with_jobs`, `by_seniority[7]`, `by_work_type[4]`,
+  `by_source[]`, `top_companies[12]`, `posted_by_day[21]`, `mid_share_pct`),
+  all over `status='open'`. `schema.sql` also `GRANT EXECUTE ON ALL FUNCTIONS
+  … TO service_role` (+ default privileges). Called as
+  `supabaseAdmin.schema('crawler').rpc('jobs_analytics')` — the `crawler`
+  schema must be added under Supabase → Settings → API → **Exposed schemas**.
+- **`search/jobs_search.{sql,js}`** — `search_jobs()` / `list_jobs()` gained a
+  `p_seniority text[]` filter and return the `seniority` column; JS adds a
+  `jobsAnalytics(db)` wrapper. (Signatures changed → the file `DROP FUNCTION`s
+  the old ones first.)
 
 ---
 
@@ -105,10 +153,11 @@ Thresholds overridable: `PGPIPE_CLOSE_AFTER_DAYS`, `PGPIPE_PER_COMPANY_CAP`,
 
 `tools/trim_csvs.py` selection (from `*.csv.upstream`):
 
-- **Eligible** = company has ≥1 board and *every* board uses a **rich** monitor
-  (`m.rich` in upstream's registry: greenhouse, ashby, lever, recruitee, gem,
-  pinpoint, oracle_hcm, amazon, rss, deel, jobylon, almacareer, …) that is
-  **not** browser-backed. 4036 companies qualify upstream.
+- **Eligible** = company has ≥1 board and *every* board uses a monitor in
+  `LOCAL_RICH` = upstream's rich registry (greenhouse, ashby, lever, recruitee,
+  gem, pinpoint, oracle_hcm, amazon, rss, deel, jobylon, almacareer, …) **plus
+  `workday`** (rich here via `src/pgpipe/monitors_workday.py`), and not
+  browser-backed. 4197 companies qualify upstream.
 - **Ranked** by: curated brand list (+10), `wikidataId` in extras (+5),
   `sameAs` (+2), industry ∈ {Technology, Financial Services} (+3) or
   {media, aerospace, automotive, biotech, robotics, cyber} (+1),
@@ -116,18 +165,18 @@ Thresholds overridable: `PGPIPE_CLOSE_AFTER_DAYS`, `PGPIPE_PER_COMPANY_CAP`,
   curated pick that is eligible.
 
 Result: **500 companies / 516 boards**. Monitor mix:
-`greenhouse 333, ashby 98, lever 35, rss 16, pinpoint 12, recruitee 7, gem 3,
-almacareer 3, oracle_hcm 3, jobylon 2, amazon 1, deel 1, recruiter_co_kr 1,
-inline 1`.
+`greenhouse 310, ashby 94, lever 35, workday 27, rss 16, pinpoint 12,
+recruitee 7, gem 3, almacareer 3, oracle_hcm 3, jobylon 2, amazon 1, deel 1,
+recruiter_co_kr 1, inline 1`.
 
 ### Excluded — need jobseek's scraper pipeline (re-add later)
 
 URL-only monitors were dropped because they need a scraper to get any job data.
 Named targets lost this way: `google` (sitemap), `two-sigma` / `d-e-shaw-group`
-(dom), `checkout-com` / `g-research` / `nvidia` / `crowdstrike` / `snyk`
-(workday), `wise` (smartrecruiters), `huggingface` (workable), `rippling`
+(dom), `wise` (smartrecruiters), `huggingface` (workable), `rippling`
 (rippling), `circle` / `canva` / `aiven` (sitemap), `revolut` (nextdata),
-`castelion` (dom).
+`castelion` (dom). **Workday is now supported** — `checkout-com`, `g-research`,
+`nvidia`, `crowdstrike`, `snyk` (and 22 more Workday boards) are back in.
 
 ### Excluded — Playwright/browser (from the earlier phase, still excluded)
 
@@ -159,21 +208,25 @@ Also removed earlier: `Dockerfile`, `docker-compose.yml`, `deploy*.sh`,
 
 ---
 
-## 7. NOT verified from this environment
+## 7. Verification status
 
-The sandbox blocked every outbound DB connection and every script making
-outbound HTTP, so the following were **not run** and must be done by the user
-(commands in `RUN_LOCAL.md`):
+**Verified against the live shared Supabase DB (round 2):** `jobs migrate`
+(schema + `seniority` column + `jobs_analytics()` + grants applied);
+`jobs sync` (500 companies / 516 boards incl. 27 Workday); `jobs stats`;
+`crawler.jobs_analytics()` returns the exact contract shape; a read-only
+projection of `tech_filter` + `seniority` over the existing rows.
 
-- the `information_schema.tables` collision check on the shared Supabase DB
-  (mitigated by using the dedicated `crawler` schema unconditionally);
-- `jobs migrate` / `jobs sync` / `jobs run` against the live DB;
-- a real crawl pass, sample rows, and DB-size delta.
+**Blocked for the agent, must be run by the user:** `jobs purge` (TRUNCATE —
+the sandbox blocks bulk-destructive DB ops). Run the clean re-scrape yourself:
+`jobs migrate && jobs purge && jobs sync && jobs run --minutes 20`.
+Also add `crawler` to Supabase → Settings → API → **Exposed schemas** so the
+webapp's `.schema('crawler').rpc('jobs_analytics')` resolves.
 
-What **was** verified offline: `uv sync` + `uv lock --check`; `jobs --help` and
-every subparser; `import src.pgpipe.*` + `src.core.monitors` (54 rich monitors);
-`DiscoveredJob → compact row` mapping; `ruff` + `py_compile` clean on
-`src/pgpipe/`; both workflow YAMLs parse; `search/jobs_search.{sql,js}`.
+**Verified offline:** `uv sync` + `uv lock --check`; `jobs --help` + every
+subparser; `import src.pgpipe.*` + `src.core.monitors`; `is_tech_role` /
+`seniority_of` unit checks; Workday `_cfg` + posting parse over all 5 upstream
+config spellings; `ruff` + `py_compile` clean; both workflow YAMLs;
+`search/jobs_search.{sql,js}`.
 
 ---
 
