@@ -55,8 +55,18 @@ is bypassed by a new single-process package, **`src/pgpipe/`**.
 - **`seniority` column** on `crawler.job_posting` (`text NOT NULL DEFAULT
   'unknown'`, indexed). Derived at ingest by `src/pgpipe/seniority.py::
   seniority_of(title)` — most-specific-first so "Senior Staff Engineer" →
-  `principal`, "New Grad SWE Intern" → `intern`. A bare "Software Engineer"
-  with no level cue → `unknown` (per the spec's `else unknown`).
+  `principal`, "New Grad SWE Intern" → `intern`.
+  **`IC_DEFAULT_MID = True`** (a one-line revert): when a title matches none of
+  the explicit buckets *and* reads as an individual-contributor
+  engineering/dev/science role (`is_tech_role` or contains
+  engineer/developer/programmer/sde/swe/scientist) *and* is not a
+  manager/director/head/lead/vp/chief/officer title, it defaults to **`mid`**
+  instead of `unknown` — an unqualified "Software Engineer" is conventionally
+  ~2-4 YoE, and the analytics tab needs a usable "mid" bucket. Non-IC
+  ambiguous titles still fall to `unknown`. Effect on the live tech-only set:
+  `mid` 1.6 % → **26.3 %**, `unknown` 41.6 % → **15.8 %**.
+  Re-tagged on every upsert, so a `jobs run` (or the 6 h cron) after this
+  change updates existing rows' `seniority`.
 - **Workday** — `src/pgpipe/monitors_workday.py`. jobseek's
   `src/core/monitors/workday.py` is URL-only (needs a scraper); this hits the
   Workday CXS search API directly
