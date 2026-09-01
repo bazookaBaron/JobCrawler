@@ -35,6 +35,11 @@ jobs:
       PGPIPE_SCHEMA: crawler
       PGPIPE_CONCURRENCY: "12"
       RUN_MINUTES: "20"
+      # Crawl-budget split: ~70% of each pass goes to the big ATS providers
+      # (greenhouse + workday), ~30% to the long tail. Both groups keep
+      # draining; if one empties the other takes the whole remaining budget.
+      PGPIPE_PRIORITY_MONITORS: "greenhouse,workday"
+      PGPIPE_PRIORITY_WEIGHT: "0.7"
 
     steps:
       - name: Checkout

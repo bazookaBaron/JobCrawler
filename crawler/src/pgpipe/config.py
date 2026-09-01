@@ -38,6 +38,11 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+def _csv_lower(name: str, default: str) -> tuple[str, ...]:
+    raw = os.environ.get(name, "").strip() or default
+    return tuple(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
 @dataclass(frozen=True)
 class Settings:
     # Supabase Postgres — the ONLY external dependency. No REDIS_URL anymore.
@@ -63,6 +68,17 @@ class Settings:
 
     # Reset 'claimed' queue rows older than this at the start of each run.
     reclaim_after_minutes: int = _int("PGPIPE_RECLAIM_AFTER_MIN", 30)
+
+    # Crawl-budget weighting. Boards whose monitor_type is in
+    # `priority_monitor_types` (the big ATS providers) are claimed first for
+    # `priority_weight` of the claims in each pass; everything else shares the
+    # rest. Both groups keep draining — if one empties, the other takes 100%
+    # of the remaining budget, so nothing starves. Set weight to 0 or 1 (or
+    # clear the list) to fall back to plain FIFO.
+    priority_monitor_types: tuple[str, ...] = _csv_lower(
+        "PGPIPE_PRIORITY_MONITORS", "greenhouse,workday"
+    )
+    priority_weight: float = _float("PGPIPE_PRIORITY_WEIGHT", 0.7)
 
     # Retention.
     per_company_cap: int = _int("PGPIPE_PER_COMPANY_CAP", 400)

@@ -7,9 +7,26 @@ reset by reclaim_stale() at the start of every run.
 """
 from __future__ import annotations
 
+import random
+
 import asyncpg
 
 from src.pgpipe.config import settings
+
+# Claim the oldest pending task, optionally restricted to (or excluded from)
+# the priority monitor_types. `{extra}` is only ever spliced with the two
+# fixed fragments below — never user input; the type list is passed as $1.
+_CLAIM_SELECT = """
+    SELECT q.id, q.board_slug
+    FROM crawl_queue q
+    JOIN job_board b ON b.board_slug = q.board_slug
+    WHERE q.status = 'pending'{extra}
+    ORDER BY q.id
+    FOR UPDATE OF q SKIP LOCKED
+    LIMIT 1
+"""
+_ONLY_PRIORITY = " AND b.monitor_type = ANY($1::text[])"
+_NON_PRIORITY = " AND NOT (b.monitor_type = ANY($1::text[]))"
 
 
 async def reclaim_stale(pool: asyncpg.Pool) -> int:
@@ -58,20 +75,34 @@ async def enqueue_due(pool: asyncpg.Pool) -> int:
     return int(row or 0)
 
 
+def _claim_plan() -> tuple[tuple[str, list], ...]:
+    """Which SELECT(s) to try, in order. With priority weighting on, pick a
+    preferred group per call (priority vs. the long tail) by weight, and keep
+    the other as a fallback so neither group starves when one drains."""
+    prio = list(settings.priority_monitor_types)
+    weight = settings.priority_weight
+    if not prio or not (0.0 < weight < 1.0):
+        return ((_CLAIM_SELECT.format(extra=""), []),)
+    if random.random() < weight:
+        first, second = _ONLY_PRIORITY, _NON_PRIORITY
+    else:
+        first, second = _NON_PRIORITY, _ONLY_PRIORITY
+    return (
+        (_CLAIM_SELECT.format(extra=first), [prio]),
+        (_CLAIM_SELECT.format(extra=second), [prio]),
+    )
+
+
 async def claim_one(pool: asyncpg.Pool) -> asyncpg.Record | None:
-    """Atomically claim the oldest pending task. Returns the board row
-    (joined with job_board) or None when the queue is drained."""
+    """Atomically claim a pending task (biased toward settings.priority_
+    monitor_types — see _claim_plan). Returns the board row joined with
+    job_board, or None when the queue is drained."""
     async with pool.acquire() as conn, conn.transaction():
-        task = await conn.fetchrow(
-            """
-            SELECT id, board_slug
-            FROM crawl_queue
-            WHERE status = 'pending'
-            ORDER BY id
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-            """
-        )
+        task = None
+        for sql, params in _claim_plan():
+            task = await conn.fetchrow(sql, *params)
+            if task is not None:
+                break
         if task is None:
             return None
         return await conn.fetchrow(
