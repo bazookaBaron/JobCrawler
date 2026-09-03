@@ -5,10 +5,10 @@
     jobs sync                    data/*.csv -> <schema>.company / job_board
     jobs run [--minutes N]       one bounded crawl pass (default 20): reclaim ->
                                  enqueue -> crawl (tech-filter + seniority-tag) ->
-                                 close-stale -> prune
-    jobs close-stale [--days N]  status='closed' for postings unseen N days (def 3)
+                                 close-stale -> hard-delete (2-day age cap) -> prune
+    jobs close-stale [--days N]  status='closed' for postings unseen N days (def 2)
     jobs prune [--cap N]         keep newest N postings per company (def 400)
-    jobs hard-delete [--days N]  DELETE postings unseen N days (def 5)
+    jobs hard-delete [--days N]  DELETE postings older than N days by first_seen (def 2)
     jobs stats                   row counts
 
 Clean re-scrape:  jobs migrate && jobs purge && jobs sync && jobs run --minutes 20
@@ -109,7 +109,7 @@ async def _cmd_hard_delete(days: int | None) -> int:
         n = await cleanup.hard_delete_stale(pool, days)
     finally:
         await pool.close()
-    _p({"hard_deleted": n, "days": days or settings.delete_after_days})
+    _p({"hard_deleted": n, "days": days or settings.max_age_days})
     return 0
 
 

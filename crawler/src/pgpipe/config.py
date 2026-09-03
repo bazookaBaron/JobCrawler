@@ -80,10 +80,15 @@ class Settings:
     )
     priority_weight: float = _float("PGPIPE_PRIORITY_WEIGHT", 0.7)
 
-    # Retention.
+    # Retention. The board only carries jobs first seen in the last
+    # `max_age_days` days — anything older is hard-deleted from Postgres on
+    # every crawl pass (and again by the daily cleanup workflow). `close_after
+    # _days` still hides postings that vanish from their board inside that
+    # window (webapp shows status='open' only).
     per_company_cap: int = _int("PGPIPE_PER_COMPANY_CAP", 400)
-    close_after_days: int = _int("PGPIPE_CLOSE_AFTER_DAYS", 3)
-    delete_after_days: int = _int("PGPIPE_DELETE_AFTER_DAYS", 5)
+    close_after_days: int = _int("PGPIPE_CLOSE_AFTER_DAYS", 2)
+    delete_after_days: int = _int("PGPIPE_DELETE_AFTER_DAYS", 2)
+    max_age_days: int = _int("PGPIPE_MAX_AGE_DAYS", 2)
 
     worker_id: str = os.environ.get("PGPIPE_WORKER_ID", "").strip() or f"gha-{os.getpid()}"
 

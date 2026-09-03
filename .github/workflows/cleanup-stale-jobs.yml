@@ -1,10 +1,10 @@
 name: cleanup-stale-jobs
 
-# Daily hard delete: remove postings not seen live in 5+ days. FK cascades from
+# Daily hard delete: remove postings older than 2 days (by first_seen_at) — the
+# board only carries jobs from the last 2 days. FK cascades from
 # crawler.job_posting are limited to nothing downstream (queue/board reference
-# boards, not postings), so this is a plain DELETE. `crawl-jobs` already marks
-# postings closed at 3 days; this is the final GC + a safety net if the crawl
-# workflow is paused.
+# boards, not postings), so this is a plain DELETE. `crawl-jobs` runs the same
+# age-cap delete every pass; this is the safety net if that workflow is paused.
 on:
   schedule:
     - cron: "17 4 * * *"      # 04:17 UTC daily, offset from the 6h crawl cron
@@ -24,7 +24,7 @@ jobs:
     env:
       LOCAL_DATABASE_URL: ${{ secrets.LOCAL_DATABASE_URL }}
       PGPIPE_SCHEMA: crawler
-      DELETE_AFTER_DAYS: "5"
+      DELETE_AFTER_DAYS: "2"   # delete postings older than N days (first_seen_at)
 
     steps:
       - name: Checkout

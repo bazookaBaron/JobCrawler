@@ -51,14 +51,19 @@ async def prune_per_company(pool: asyncpg.Pool, cap: int | None = None) -> int:
 
 
 async def hard_delete_stale(pool: asyncpg.Pool, days: int | None = None) -> int:
-    """DELETE postings not seen in `days` days. Daily cleanup workflow."""
-    d = int(days if days is not None else settings.delete_after_days)
+    """DELETE postings older than `days` days by first_seen_at — the hard age
+    cap on the board. Runs at the end of every crawl pass and again in the
+    daily cleanup workflow. Keyed on age (not last_seen) so a missed crawl
+    can't evict a genuinely fresh posting; anything not seen live for `days`
+    days is already older than `days` and gets swept here too.
+    """
+    d = int(days if days is not None else settings.max_age_days)
     async with pool.acquire() as conn:
         n = await conn.fetchval(
             f"""
             WITH del AS (
                 DELETE FROM job_posting
-                WHERE last_seen_at < now() - interval '{d} days'
+                WHERE first_seen_at < now() - interval '{d} days'
                 RETURNING 1
             )
             SELECT count(*) FROM del

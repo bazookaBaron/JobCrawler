@@ -75,6 +75,7 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
 
     remaining = await pool.fetchval("SELECT count(*) FROM crawl_queue WHERE status='pending'")
     closed = await cleanup.close_stale(pool)
+    deleted_old = await cleanup.hard_delete_stale(pool)  # enforce the 2-day age cap every pass
     pruned = await cleanup.prune_per_company(pool)
 
     kept = stats["upserted"]
@@ -82,6 +83,7 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
     seen = kept + dropped
     notes = (
         f"reclaimed={reclaimed} enqueued={enqueued} remaining_pending={remaining} "
+        f"deleted_old={deleted_old} "
         f"tech_filter: kept={kept} dropped_nontech={dropped} "
         f"({round(100.0 * kept / seen, 1) if seen else 0.0}% kept of {seen} seen)"
     )
@@ -115,6 +117,7 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
         "postings_upserted": stats["upserted"],
         "postings_dropped_nontech": dropped,
         "postings_closed": closed,
+        "postings_deleted_old": deleted_old,
         "postings_pruned": pruned,
         "errors": stats["errors"],
     }

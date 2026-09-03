@@ -3,8 +3,9 @@ name: crawl-jobs
 # $0 compute: one scheduled GitHub Actions job. Single process, NO Redis, no
 # server. `jobs run` reclaims stale queue rows, enqueues every enabled board,
 # crawls them with an in-process politeness gate, upserts compact rows into the
-# dedicated `crawler` Postgres schema, then closes postings not seen for 3 days
-# and trims each company to its newest 400.
+# dedicated `crawler` Postgres schema, then hard-deletes any posting older than
+# 2 days (first_seen_at) and trims each company to its newest 400. The board
+# only ever carries jobs from the last 2 days.
 #
 # CRON TUNING: every 6 hours is a starting point. Check the "crawl" step
 # duration against RUN_MINUTES / the job timeout. ~516 boards at concurrency 12
@@ -40,6 +41,10 @@ jobs:
       # draining; if one empties the other takes the whole remaining budget.
       PGPIPE_PRIORITY_MONITORS: "greenhouse,workday"
       PGPIPE_PRIORITY_WEIGHT: "0.7"
+      # Board retention: keep only jobs first seen in the last N days; older
+      # rows are hard-deleted at the end of every pass.
+      PGPIPE_MAX_AGE_DAYS: "2"
+      PGPIPE_CLOSE_AFTER_DAYS: "2"
 
     steps:
       - name: Checkout
