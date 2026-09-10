@@ -109,6 +109,44 @@ ALTER TABLE {{SCHEMA}}.job_posting
 CREATE INDEX IF NOT EXISTS job_posting_search_idx
     ON {{SCHEMA}}.job_posting USING gin (search_tsv);
 
+-- --- webapp read-path indexes --------------------------------------
+-- The Vloombox app (frontend/server.js, /api/jobs*) reads this table with:
+--   WHERE status='open' AND first_seen_at >= <cutoff> ORDER BY first_seen_at DESC, id DESC
+--   distinct `source` over the open set                (source facet)
+--   company_slug / location / title  ILIKE '%...%'      (filters + /api/jobs/facets)
+-- The crawler's own writes don't need these; they're purely for the reader.
+-- Wrapped in a DO block so `jobs migrate` can't abort if pg_trgm's opclass
+-- isn't on this connection's search_path (Supabase installs it in `extensions`).
+-- The always-safe partial btree indexes still get created in that case; run the
+-- *_trgm_idx statements once from the Supabase SQL editor if the NOTICE fires.
+DO $webapp_idx$
+BEGIN
+    CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+    EXECUTE $q$
+        CREATE INDEX IF NOT EXISTS job_posting_open_recent_idx
+            ON {{SCHEMA}}.job_posting (first_seen_at DESC, id DESC)
+            WHERE status = 'open'
+    $q$;
+    EXECUTE $q$
+        CREATE INDEX IF NOT EXISTS job_posting_open_source_idx
+            ON {{SCHEMA}}.job_posting (source)
+            WHERE status = 'open' AND source IS NOT NULL
+    $q$;
+
+    BEGIN
+        EXECUTE $q$ CREATE INDEX IF NOT EXISTS job_posting_company_trgm_idx
+            ON {{SCHEMA}}.job_posting USING gin (company_slug gin_trgm_ops) $q$;
+        EXECUTE $q$ CREATE INDEX IF NOT EXISTS job_posting_location_trgm_idx
+            ON {{SCHEMA}}.job_posting USING gin (location gin_trgm_ops) $q$;
+        EXECUTE $q$ CREATE INDEX IF NOT EXISTS job_posting_title_trgm_idx
+            ON {{SCHEMA}}.job_posting USING gin (title gin_trgm_ops) $q$;
+    EXCEPTION WHEN undefined_object OR undefined_function THEN
+        RAISE NOTICE 'pg_trgm opclass not on search_path — create job_posting_*_trgm_idx manually in the Supabase SQL editor';
+    END;
+END
+$webapp_idx$;
+
 -- --- run log (one row per `jobs run`) --------------------------------
 CREATE TABLE IF NOT EXISTS {{SCHEMA}}.crawl_run (
     id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
