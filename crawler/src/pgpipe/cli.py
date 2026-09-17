@@ -12,6 +12,8 @@
     jobs snapshot-market         compute crawler.compute_market_snapshot() and
                                   upsert it into public.jobs_market_snapshot_daily
                                   for CURRENT_DATE (run BEFORE hard-delete)
+    jobs backfill-posted-at      one-time: parse date_posted -> posted_at for
+                                  open rows that predate the column
     jobs stats                   row counts
 
 Clean re-scrape:  jobs migrate && jobs purge && jobs sync && jobs run --minutes 20
@@ -25,9 +27,12 @@ import asyncio
 import json
 import sys
 
+from datetime import datetime, timezone
+
 from src.pgpipe import cleanup, csv_sync
 from src.pgpipe.config import settings
 from src.pgpipe.db import apply_schema, connect
+from src.pgpipe.posted_at import parse_posted_at
 from src.pgpipe.runner import run as run_pass
 
 
@@ -160,6 +165,39 @@ async def _cmd_snapshot_market() -> int:
     return 0
 
 
+async def _cmd_backfill_posted_at() -> int:
+    """One-time fix for rows that predate the posted_at column: parse the raw
+    date_posted text (dateutil, same rules as ingest.py) for every open row
+    that doesn't have a posted_at yet. Unlike country, this genuinely needs a
+    backfill — date_posted text for currently-open postings goes back to
+    2019, so 1-day churn alone won't correct it. Falls back to first_seen_at
+    for anything unparseable, same as a fresh insert would."""
+    pool = await connect()
+    updated = fell_back = 0
+    try:
+        rows = await pool.fetch(
+            "SELECT id, date_posted, first_seen_at FROM job_posting "
+            "WHERE status = 'open' AND posted_at IS NULL"
+        )
+        batch = []
+        for r in rows:
+            parsed = parse_posted_at(r["date_posted"])
+            if parsed is None:
+                parsed = r["first_seen_at"] or datetime.now(timezone.utc)
+                fell_back += 1
+            batch.append((parsed, r["id"]))
+        if batch:
+            async with pool.acquire() as conn:
+                await conn.executemany(
+                    "UPDATE job_posting SET posted_at = $1 WHERE id = $2", batch
+                )
+            updated = len(batch)
+    finally:
+        await pool.close()
+    _p({"backfill_posted_at": "ok", "rows_updated": updated, "fell_back_to_first_seen": fell_back})
+    return 0
+
+
 async def _cmd_stats() -> int:
     pool = await connect()
     try:
@@ -203,6 +241,7 @@ def main() -> None:
     hp = sub.add_parser("hard-delete")
     hp.add_argument("--days", type=int, default=None)
     sub.add_parser("snapshot-market")
+    sub.add_parser("backfill-posted-at")
     sub.add_parser("stats")
 
     args = ap.parse_args()
@@ -222,6 +261,8 @@ def main() -> None:
         rc = asyncio.run(_cmd_hard_delete(args.days))
     elif args.cmd == "snapshot-market":
         rc = asyncio.run(_cmd_snapshot_market())
+    elif args.cmd == "backfill-posted-at":
+        rc = asyncio.run(_cmd_backfill_posted_at())
     elif args.cmd == "stats":
         rc = asyncio.run(_cmd_stats())
     else:  # pragma: no cover

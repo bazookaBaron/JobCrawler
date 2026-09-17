@@ -121,6 +121,23 @@ ALTER TABLE {{SCHEMA}}.job_posting
 CREATE INDEX IF NOT EXISTS job_posting_country_idx
     ON {{SCHEMA}}.job_posting(country) WHERE status = 'open';
 
+-- Real posting timestamp, parsed offline from the raw provider `date_posted`
+-- string at ingest (src/pgpipe/posted_at.py; dateutil handles the mixed
+-- ISO-8601 / RFC-2822 formats different ATSs return). Deliberately distinct
+-- from first_seen_at: first_seen_at is "when WE discovered this row" (used
+-- for storage retention/cleanup), posted_at is "when the job was actually
+-- posted" (used by the webapp's 24h freshness gate) — a listing we only just
+-- crawled for the first time can still be weeks old. Falls back to now() at
+-- insert time (COALESCE in the upsert) when the source gives no date at all,
+-- and never regresses to null on a later crawl pass that omits it. UNLIKE
+-- country, this DOES need a backfill for pre-existing rows: date_posted text
+-- for currently-open postings goes back to 2019, so 1-day churn alone won't
+-- correct it — run `jobs backfill-posted-at` once after this migration.
+ALTER TABLE {{SCHEMA}}.job_posting
+    ADD COLUMN IF NOT EXISTS posted_at timestamptz;
+CREATE INDEX IF NOT EXISTS job_posting_posted_at_idx
+    ON {{SCHEMA}}.job_posting(posted_at DESC, id DESC) WHERE status = 'open';
+
 -- --- simple full-text search over title + company (no description) ----
 ALTER TABLE {{SCHEMA}}.job_posting
     ADD COLUMN IF NOT EXISTS search_tsv tsvector
@@ -134,7 +151,10 @@ CREATE INDEX IF NOT EXISTS job_posting_search_idx
 
 -- --- webapp read-path indexes --------------------------------------
 -- The Vloombox app (frontend/server.js, /api/jobs*) reads this table with:
---   WHERE status='open' AND first_seen_at >= <cutoff> ORDER BY first_seen_at DESC, id DESC
+--   WHERE status='open' AND posted_at >= <cutoff> ORDER BY posted_at DESC, id DESC
+--   (first_seen_at is still used for the SEO "content freshness" signal on
+--   /jobs/company/:slug — that's crawl activity, not posting age, so it kept
+--   its own index below rather than switching to posted_at)
 --   distinct `source` over the open set                (source facet)
 --   company_slug / location / title  ILIKE '%...%'      (filters + /api/jobs/facets)
 -- The crawler's own writes don't need these; they're purely for the reader.

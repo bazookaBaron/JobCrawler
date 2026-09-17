@@ -36,6 +36,7 @@ dependencies = [
     "beautifulsoup4>=4.15.0",
     "jsonschema>=4.23",
     "tzdata>=2026.3",
+    "python-dateutil>=2.9.0",
 ]
 
 [project.scripts]

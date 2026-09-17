@@ -12,6 +12,7 @@ import httpx
 from src.core.monitors import BoardGoneError, DiscoveredJob, get_discoverer
 from src.pgpipe.country import classify_country
 from src.pgpipe.monitors_workday import discover_workday
+from src.pgpipe.posted_at import parse_posted_at
 from src.pgpipe.seniority import seniority_of
 from src.pgpipe.tech_filter import TECH_ONLY, is_tech_role
 
@@ -71,6 +72,7 @@ def _to_record(company_slug: str, board_slug: str, source: str, job: DiscoveredJ
     titles = _titles(job)
     locations = job.locations or []
     primary_location = _first(locations)
+    raw_date_posted = job.date_posted or None
     return (
         company_slug,
         board_slug,
@@ -84,9 +86,10 @@ def _to_record(company_slug: str, board_slug: str, source: str, job: DiscoveredJ
         (job.job_location_type or None),
         _norm_employment(job.employment_type),
         _department(job),
-        (job.date_posted or None),
+        raw_date_posted,
         seniority_of(_first(titles)),
         classify_country(primary_location, locations),
+        parse_posted_at(raw_date_posted),
     )
 
 
@@ -94,8 +97,9 @@ _UPSERT = """
 INSERT INTO job_posting
     (company_slug, board_slug, source, external_id, url, title, titles,
      location, locations, location_type, employment_type, department, date_posted,
-     seniority, country, first_seen_at, last_seen_at, status)
-VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10,$11,$12,$13,$14,$15, now(), now(), 'open')
+     seniority, country, posted_at, first_seen_at, last_seen_at, status)
+VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10,$11,$12,$13,$14,$15,
+        COALESCE($16, now()), now(), now(), 'open')
 ON CONFLICT (company_slug, url) DO UPDATE SET
     board_slug      = EXCLUDED.board_slug,
     source          = EXCLUDED.source,
@@ -110,6 +114,9 @@ ON CONFLICT (company_slug, url) DO UPDATE SET
     date_posted     = EXCLUDED.date_posted,
     seniority       = EXCLUDED.seniority,
     country         = EXCLUDED.country,
+    -- A source that stops reporting date_posted on a later crawl shouldn't
+    -- blow away a real parsed value we already have.
+    posted_at       = COALESCE(EXCLUDED.posted_at, job_posting.posted_at),
     last_seen_at    = now(),
     status          = 'open'
 """
