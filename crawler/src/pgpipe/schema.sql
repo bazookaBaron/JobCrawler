@@ -319,8 +319,13 @@ WITH open_jobs AS (
 totals AS (
     SELECT
         (SELECT count(*) FROM {{SCHEMA}}.job_posting WHERE status = 'open') AS total_open,
+        -- posted_at (real posting date), NOT first_seen_at (our discovery
+        -- time) — at 1-day retention, first_seen_at is within 24h for
+        -- virtually every row in the table by construction, which would make
+        -- this metric almost always equal total_open and useless as a
+        -- distinct "hiring velocity" signal.
         (SELECT count(*) FROM {{SCHEMA}}.job_posting
-            WHERE first_seen_at > now() - interval '24 hours') AS new_postings,
+            WHERE posted_at > now() - interval '24 hours') AS new_postings,
         (SELECT count(*) FROM {{SCHEMA}}.job_posting
             WHERE status = 'closed' AND last_seen_at > now() - interval '24 hours'
         ) AS closed_postings
@@ -347,7 +352,7 @@ top_co AS (
     SELECT coalesce(co.name, jp.company_slug) AS company, count(*) AS new_postings
     FROM {{SCHEMA}}.job_posting jp
     LEFT JOIN {{SCHEMA}}.company co ON co.slug = jp.company_slug
-    WHERE jp.first_seen_at > now() - interval '24 hours'
+    WHERE jp.posted_at > now() - interval '24 hours'
     GROUP BY coalesce(co.name, jp.company_slug)
     ORDER BY count(*) DESC, company
     LIMIT 10
