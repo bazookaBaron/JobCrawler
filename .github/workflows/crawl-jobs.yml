@@ -4,15 +4,16 @@ name: crawl-jobs
 # server. `jobs run` reclaims stale queue rows, enqueues every enabled board,
 # crawls them with an in-process politeness gate, upserts compact rows into the
 # dedicated `crawler` Postgres schema, then hard-deletes any posting older than
-# 2 days (first_seen_at) and trims each company to its newest 400. The board
-# only ever carries jobs from the last 2 days.
+# 1 day (first_seen_at) and trims each company to its newest 400. The board
+# only ever carries jobs from the last 24 hours.
 #
-# CRON TUNING: every 6 hours is a starting point. Check the "crawl" step
-# duration against RUN_MINUTES / the job timeout. ~516 boards at concurrency 12
-# with ATS politeness (~0.6s per shared host) is roughly 5-12 min.
+# CRON TUNING: every 2 hours (repo is public -> unlimited free Actions
+# minutes, no cost constraint). Check the "crawl" step duration against
+# RUN_MINUTES / the job timeout. ~516 boards at concurrency 12 with ATS
+# politeness (~0.6s per shared host) is roughly 5-12 min.
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */2 * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -43,8 +44,8 @@ jobs:
       PGPIPE_PRIORITY_WEIGHT: "0.7"
       # Board retention: keep only jobs first seen in the last N days; older
       # rows are hard-deleted at the end of every pass.
-      PGPIPE_MAX_AGE_DAYS: "2"
-      PGPIPE_CLOSE_AFTER_DAYS: "2"
+      PGPIPE_MAX_AGE_DAYS: "1"
+      PGPIPE_CLOSE_AFTER_DAYS: "1"
 
     steps:
       - name: Checkout
@@ -65,7 +66,7 @@ jobs:
       - name: Sync curated companies + boards (CSV -> Postgres)
         run: uv run --no-sync jobs sync | tee ../sync.json
 
-      - name: Crawl (bounded) + close stale (3d) + prune per-company cap (400)
+      - name: Crawl (bounded) + close stale (1d) + prune per-company cap (400)
         run: |
           set -euo pipefail
           uv run --no-sync jobs run --minutes "${RUN_MINUTES}" | tee ../run.json

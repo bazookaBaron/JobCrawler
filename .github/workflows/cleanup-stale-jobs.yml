@@ -1,13 +1,17 @@
 name: cleanup-stale-jobs
 
-# Daily hard delete: remove postings older than 2 days (by first_seen_at) — the
-# board only carries jobs from the last 2 days. FK cascades from
-# crawler.job_posting are limited to nothing downstream (queue/board reference
-# boards, not postings), so this is a plain DELETE. `crawl-jobs` runs the same
-# age-cap delete every pass; this is the safety net if that workflow is paused.
+# Every 6 hours: snapshot market analytics, THEN hard-delete postings older
+# than 1 day (by first_seen_at) — the board only carries jobs from the last
+# 24 hours. The snapshot step must run before hard-delete: once retention is
+# down to 24h, public.jobs_market_snapshot_daily is the only surviving record
+# of a day's activity, so it has to be captured before the source rows it's
+# computed from get purged. FK cascades from crawler.job_posting are limited
+# to nothing downstream (queue/board reference boards, not postings), so the
+# delete is a plain DELETE. `crawl-jobs` runs the same age-cap delete every
+# pass; this is the safety net if that workflow is paused.
 on:
   schedule:
-    - cron: "17 4 * * *"      # 04:17 UTC daily, offset from the 6h crawl cron
+    - cron: "27 */6 * * *"    # :27 past every 6th hour, offset from the 2h crawl cron
   workflow_dispatch: {}
 
 permissions:
@@ -24,7 +28,7 @@ jobs:
     env:
       LOCAL_DATABASE_URL: ${{ secrets.LOCAL_DATABASE_URL }}
       PGPIPE_SCHEMA: crawler
-      DELETE_AFTER_DAYS: "2"   # delete postings older than N days (first_seen_at)
+      DELETE_AFTER_DAYS: "1"   # delete postings older than N days (first_seen_at)
 
     steps:
       - name: Checkout
@@ -39,6 +43,11 @@ jobs:
       - name: Install dependencies (locked)
         run: uv sync --frozen
 
+      - name: Snapshot market analytics (must run before hard-delete)
+        run: |
+          set -euo pipefail
+          uv run --no-sync jobs snapshot-market | tee ../snapshot.json
+
       - name: Hard-delete postings not seen in ${{ env.DELETE_AFTER_DAYS }} days
         run: |
           set -euo pipefail
@@ -51,6 +60,8 @@ jobs:
           set -uo pipefail
           {
             echo "## cleanup-stale-jobs"
+            echo '### snapshot-market'
+            echo '```json'; cat ../snapshot.json 2>/dev/null || echo '{}'; echo '```'
             echo '```json'; cat ../delete.json 2>/dev/null || echo '{}'; echo '```'
             echo '### db stats'
             echo '```json'

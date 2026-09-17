@@ -33,6 +33,14 @@ def _parse_config(raw: str | None) -> str:
         return "{}"
 
 
+_COMPANY_TYPES = {"product", "startup", "service", "unknown"}
+
+
+def _company_type(raw: str | None) -> str:
+    v = (raw or "").strip().lower()
+    return v if v in _COMPANY_TYPES else "unknown"
+
+
 async def sync(pool: asyncpg.Pool) -> dict[str, int]:
     companies = _read_companies()
     boards = _read_boards()
@@ -40,12 +48,13 @@ async def sync(pool: asyncpg.Pool) -> dict[str, int]:
     async with pool.acquire() as conn, conn.transaction():
         await conn.executemany(
             """
-            INSERT INTO company (slug, name, website, industry, updated_at)
-            VALUES ($1, $2, $3, $4, now())
+            INSERT INTO company (slug, name, website, industry, company_type, updated_at)
+            VALUES ($1, $2, $3, $4, $5, now())
             ON CONFLICT (slug) DO UPDATE SET
                 name = EXCLUDED.name,
                 website = EXCLUDED.website,
                 industry = EXCLUDED.industry,
+                company_type = EXCLUDED.company_type,
                 updated_at = now()
             """,
             [
@@ -54,6 +63,7 @@ async def sync(pool: asyncpg.Pool) -> dict[str, int]:
                     c.get("name") or c["slug"],
                     (c.get("website") or None),
                     int(c["industry"]) if (c.get("industry") or "").strip().isdigit() else None,
+                    _company_type(c.get("company_type")),
                 )
                 for c in companies
             ],

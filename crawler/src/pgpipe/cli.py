@@ -5,10 +5,13 @@
     jobs sync                    data/*.csv -> <schema>.company / job_board
     jobs run [--minutes N]       one bounded crawl pass (default 20): reclaim ->
                                  enqueue -> crawl (tech-filter + seniority-tag) ->
-                                 close-stale -> hard-delete (2-day age cap) -> prune
-    jobs close-stale [--days N]  status='closed' for postings unseen N days (def 2)
+                                 close-stale -> hard-delete (1-day age cap) -> prune
+    jobs close-stale [--days N]  status='closed' for postings unseen N days (def 1)
     jobs prune [--cap N]         keep newest N postings per company (def 400)
-    jobs hard-delete [--days N]  DELETE postings older than N days by first_seen (def 2)
+    jobs hard-delete [--days N]  DELETE postings older than N days by first_seen (def 1)
+    jobs snapshot-market         compute crawler.compute_market_snapshot() and
+                                  upsert it into public.jobs_market_snapshot_daily
+                                  for CURRENT_DATE (run BEFORE hard-delete)
     jobs stats                   row counts
 
 Clean re-scrape:  jobs migrate && jobs purge && jobs sync && jobs run --minutes 20
@@ -113,6 +116,50 @@ async def _cmd_hard_delete(days: int | None) -> int:
     return 0
 
 
+async def _cmd_snapshot_market() -> int:
+    """Run crawler.compute_market_snapshot() and upsert the result into
+    public.jobs_market_snapshot_daily for CURRENT_DATE. Meant to run BEFORE
+    hard-delete in the daily cleanup workflow: at 1-day retention this table
+    is the only surviving record of a day's activity once the source rows
+    churn out."""
+    pool = await connect()
+    try:
+        raw = await pool.fetchval("SELECT compute_market_snapshot()")
+        data = raw if isinstance(raw, dict) else json.loads(raw)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO public.jobs_market_snapshot_daily
+                    (snapshot_date, total_open, new_postings, closed_postings,
+                     by_seniority, by_work_type, by_country, by_company_type,
+                     top_companies)
+                VALUES (CURRENT_DATE, $1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb,
+                        $7::jsonb, $8::jsonb)
+                ON CONFLICT (snapshot_date) DO UPDATE SET
+                    total_open      = EXCLUDED.total_open,
+                    new_postings    = EXCLUDED.new_postings,
+                    closed_postings = EXCLUDED.closed_postings,
+                    by_seniority    = EXCLUDED.by_seniority,
+                    by_work_type    = EXCLUDED.by_work_type,
+                    by_country      = EXCLUDED.by_country,
+                    by_company_type = EXCLUDED.by_company_type,
+                    top_companies   = EXCLUDED.top_companies
+                """,
+                data["total_open"],
+                data["new_postings"],
+                data["closed_postings"],
+                json.dumps(data["by_seniority"]),
+                json.dumps(data["by_work_type"]),
+                json.dumps(data["by_country"]),
+                json.dumps(data["by_company_type"]),
+                json.dumps(data["top_companies"]),
+            )
+    finally:
+        await pool.close()
+    _p({"snapshot_market": "ok", "snapshot_date": "CURRENT_DATE", **data})
+    return 0
+
+
 async def _cmd_stats() -> int:
     pool = await connect()
     try:
@@ -155,6 +202,7 @@ def main() -> None:
     pp.add_argument("--cap", type=int, default=None)
     hp = sub.add_parser("hard-delete")
     hp.add_argument("--days", type=int, default=None)
+    sub.add_parser("snapshot-market")
     sub.add_parser("stats")
 
     args = ap.parse_args()
@@ -172,6 +220,8 @@ def main() -> None:
         rc = asyncio.run(_cmd_prune(args.cap))
     elif args.cmd == "hard-delete":
         rc = asyncio.run(_cmd_hard_delete(args.days))
+    elif args.cmd == "snapshot-market":
+        rc = asyncio.run(_cmd_snapshot_market())
     elif args.cmd == "stats":
         rc = asyncio.run(_cmd_stats())
     else:  # pragma: no cover

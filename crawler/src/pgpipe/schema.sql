@@ -17,6 +17,13 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.company (
     updated_at   timestamptz NOT NULL DEFAULT now()
 );
 
+-- company_type: hand-curated classification from data/companies.csv (see
+-- src/pgpipe/csv_sync.py). 'unknown' is a safe default the downstream
+-- (webapp) weighting can treat as low-priority-but-not-excluded.
+ALTER TABLE {{SCHEMA}}.company
+    ADD COLUMN IF NOT EXISTS company_type text NOT NULL DEFAULT 'unknown'
+    CHECK (company_type IN ('product', 'startup', 'service', 'unknown'));
+
 -- --- boards (from data/boards.csv) --------------------------------------
 CREATE TABLE IF NOT EXISTS {{SCHEMA}}.job_board (
     board_slug            text PRIMARY KEY,
@@ -87,6 +94,10 @@ CREATE INDEX IF NOT EXISTS job_posting_company_idx   ON {{SCHEMA}}.job_posting(c
 CREATE INDEX IF NOT EXISTS job_posting_board_idx     ON {{SCHEMA}}.job_posting(board_slug);
 CREATE INDEX IF NOT EXISTS job_posting_status_idx    ON {{SCHEMA}}.job_posting(status);
 CREATE INDEX IF NOT EXISTS job_posting_last_seen_idx ON {{SCHEMA}}.job_posting(last_seen_at DESC);
+-- Composite (company_slug, first_seen_at) index — also serves the webapp's
+-- "new postings per subscribed company since watermark" notification query
+-- (a simple inequality on first_seen_at uses this fine regardless of the
+-- DESC sort direction), so no separate ASC variant is added.
 CREATE INDEX IF NOT EXISTS job_posting_first_seen_idx
     ON {{SCHEMA}}.job_posting(company_slug, first_seen_at DESC);
 CREATE INDEX IF NOT EXISTS job_posting_ext_idx
@@ -97,6 +108,18 @@ CREATE INDEX IF NOT EXISTS job_posting_ext_idx
 ALTER TABLE {{SCHEMA}}.job_posting
     ADD COLUMN IF NOT EXISTS seniority text NOT NULL DEFAULT 'unknown';
 CREATE INDEX IF NOT EXISTS job_posting_seniority_idx ON {{SCHEMA}}.job_posting(seniority);
+
+-- country bucket derived offline (no geocoding API) from location/locations
+-- at ingest (src/pgpipe/country.py): 'US' | 'IN' | 'other'. No backfill for
+-- pre-existing rows — at 1-day retention every row churns out and gets
+-- replaced by a freshly-classified row within a day anyway.
+ALTER TABLE {{SCHEMA}}.job_posting
+    ADD COLUMN IF NOT EXISTS country text
+    CHECK (country IS NULL OR country IN ('US', 'IN', 'other'));
+-- The webapp filters `WHERE country IN ('US','IN')` on every jobs-board
+-- request; partial index on the open set keeps that fast.
+CREATE INDEX IF NOT EXISTS job_posting_country_idx
+    ON {{SCHEMA}}.job_posting(country) WHERE status = 'open';
 
 -- --- simple full-text search over title + company (no description) ----
 ALTER TABLE {{SCHEMA}}.job_posting
@@ -256,6 +279,108 @@ SELECT json_build_object(
     )
 );
 $fn$;
+
+-- --- market snapshot RPC (daily analytics capture) -----------------------
+-- One JSON object, single pass over job_posting (+ a join to company for
+-- by_company_type / top_companies). Called by `jobs snapshot-market`
+-- (src/pgpipe/cli.py) from the cleanup-stale-jobs workflow, BEFORE the
+-- hard-delete step — at 1-day retention this table is the only surviving
+-- record of a day's activity once the source rows churn out.
+CREATE OR REPLACE FUNCTION {{SCHEMA}}.compute_market_snapshot()
+RETURNS json
+LANGUAGE sql
+STABLE
+AS $fn$
+WITH open_jobs AS (
+    SELECT id, seniority, location_type, country, company_slug
+    FROM {{SCHEMA}}.job_posting
+    WHERE status = 'open'
+),
+totals AS (
+    SELECT
+        (SELECT count(*) FROM {{SCHEMA}}.job_posting WHERE status = 'open') AS total_open,
+        (SELECT count(*) FROM {{SCHEMA}}.job_posting
+            WHERE first_seen_at > now() - interval '24 hours') AS new_postings,
+        (SELECT count(*) FROM {{SCHEMA}}.job_posting
+            WHERE status = 'closed' AND last_seen_at > now() - interval '24 hours'
+        ) AS closed_postings
+),
+sen AS (
+    SELECT coalesce(seniority, 'unknown') AS bucket, count(*) AS n
+    FROM open_jobs GROUP BY 1
+),
+wt AS (
+    SELECT coalesce(location_type, 'unspecified') AS type, count(*) AS n
+    FROM open_jobs GROUP BY 1
+),
+ctry AS (
+    SELECT coalesce(country, 'other') AS country, count(*) AS n
+    FROM open_jobs GROUP BY 1
+),
+ctype AS (
+    SELECT coalesce(co.company_type, 'unknown') AS company_type, count(*) AS n
+    FROM open_jobs oj
+    LEFT JOIN {{SCHEMA}}.company co ON co.slug = oj.company_slug
+    GROUP BY 1
+),
+top_co AS (
+    SELECT coalesce(co.name, jp.company_slug) AS company, count(*) AS new_postings
+    FROM {{SCHEMA}}.job_posting jp
+    LEFT JOIN {{SCHEMA}}.company co ON co.slug = jp.company_slug
+    WHERE jp.first_seen_at > now() - interval '24 hours'
+    GROUP BY coalesce(co.name, jp.company_slug)
+    ORDER BY count(*) DESC, company
+    LIMIT 10
+)
+SELECT json_build_object(
+    'total_open', (SELECT total_open FROM totals),
+    'new_postings', (SELECT new_postings FROM totals),
+    'closed_postings', (SELECT closed_postings FROM totals),
+    'by_seniority', (SELECT coalesce(json_object_agg(bucket, n), '{}'::json) FROM sen),
+    'by_work_type', (SELECT coalesce(json_object_agg(type, n), '{}'::json) FROM wt),
+    'by_country', (SELECT coalesce(json_object_agg(country, n), '{}'::json) FROM ctry),
+    'by_company_type', (SELECT coalesce(json_object_agg(company_type, n), '{}'::json) FROM ctype),
+    'top_companies', (
+        SELECT coalesce(json_agg(
+            json_build_object('company', company, 'new_postings', new_postings)
+        ), '[]'::json) FROM top_co
+    )
+);
+$fn$;
+
+-- --- market snapshot table (public schema — separate webapp workstream
+-- reads this; the crawler owns creating + writing it) ---------------------
+CREATE TABLE IF NOT EXISTS public.jobs_market_snapshot_daily (
+    snapshot_date     date PRIMARY KEY,
+    total_open        bigint NOT NULL,
+    new_postings      bigint NOT NULL,
+    closed_postings   bigint NOT NULL,
+    by_seniority      jsonb NOT NULL DEFAULT '{}',
+    by_work_type      jsonb NOT NULL DEFAULT '{}',
+    by_country        jsonb NOT NULL DEFAULT '{}',
+    by_company_type   jsonb NOT NULL DEFAULT '{}',
+    top_companies     jsonb NOT NULL DEFAULT '[]',
+    created_at        timestamptz NOT NULL DEFAULT now()
+);
+-- Read-only for the webapp. RLS is enabled (every other public.* table in
+-- this project has it on) with a public SELECT policy since snapshot
+-- aggregates carry no sensitive/per-user data; writes only ever happen from
+-- `jobs snapshot-market` using the service_role connection, which bypasses RLS.
+ALTER TABLE public.jobs_market_snapshot_daily ENABLE ROW LEVEL SECURITY;
+DO $snapshot_policy$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public' AND tablename = 'jobs_market_snapshot_daily'
+          AND policyname = 'jobs_market_snapshot_daily_public_read'
+    ) THEN
+        CREATE POLICY jobs_market_snapshot_daily_public_read
+            ON public.jobs_market_snapshot_daily FOR SELECT
+            USING (true);
+    END IF;
+END
+$snapshot_policy$;
+GRANT SELECT ON public.jobs_market_snapshot_daily TO anon, authenticated, service_role;
 
 -- --- API access -----------------------------------------------------
 -- The webapp reads this schema ONLY through its Express server, which uses

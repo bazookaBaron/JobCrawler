@@ -86,9 +86,9 @@ class Settings:
     # _days` still hides postings that vanish from their board inside that
     # window (webapp shows status='open' only).
     per_company_cap: int = _int("PGPIPE_PER_COMPANY_CAP", 400)
-    close_after_days: int = _int("PGPIPE_CLOSE_AFTER_DAYS", 2)
-    delete_after_days: int = _int("PGPIPE_DELETE_AFTER_DAYS", 2)
-    max_age_days: int = _int("PGPIPE_MAX_AGE_DAYS", 2)
+    close_after_days: int = _int("PGPIPE_CLOSE_AFTER_DAYS", 1)
+    delete_after_days: int = _int("PGPIPE_DELETE_AFTER_DAYS", 1)
+    max_age_days: int = _int("PGPIPE_MAX_AGE_DAYS", 1)
 
     worker_id: str = os.environ.get("PGPIPE_WORKER_ID", "").strip() or f"gha-{os.getpid()}"
 

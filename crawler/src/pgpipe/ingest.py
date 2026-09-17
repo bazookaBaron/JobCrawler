@@ -10,6 +10,7 @@ import asyncpg
 import httpx
 
 from src.core.monitors import BoardGoneError, DiscoveredJob, get_discoverer
+from src.pgpipe.country import classify_country
 from src.pgpipe.monitors_workday import discover_workday
 from src.pgpipe.seniority import seniority_of
 from src.pgpipe.tech_filter import TECH_ONLY, is_tech_role
@@ -69,6 +70,7 @@ def _to_record(company_slug: str, board_slug: str, source: str, job: DiscoveredJ
         return None
     titles = _titles(job)
     locations = job.locations or []
+    primary_location = _first(locations)
     return (
         company_slug,
         board_slug,
@@ -77,13 +79,14 @@ def _to_record(company_slug: str, board_slug: str, source: str, job: DiscoveredJ
         job.url,
         _first(titles),
         json.dumps(titles),
-        _first(locations),
+        primary_location,
         json.dumps(locations),
         (job.job_location_type or None),
         _norm_employment(job.employment_type),
         _department(job),
         (job.date_posted or None),
         seniority_of(_first(titles)),
+        classify_country(primary_location, locations),
     )
 
 
@@ -91,8 +94,8 @@ _UPSERT = """
 INSERT INTO job_posting
     (company_slug, board_slug, source, external_id, url, title, titles,
      location, locations, location_type, employment_type, department, date_posted,
-     seniority, first_seen_at, last_seen_at, status)
-VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10,$11,$12,$13,$14, now(), now(), 'open')
+     seniority, country, first_seen_at, last_seen_at, status)
+VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10,$11,$12,$13,$14,$15, now(), now(), 'open')
 ON CONFLICT (company_slug, url) DO UPDATE SET
     board_slug      = EXCLUDED.board_slug,
     source          = EXCLUDED.source,
@@ -106,6 +109,7 @@ ON CONFLICT (company_slug, url) DO UPDATE SET
     department      = EXCLUDED.department,
     date_posted     = EXCLUDED.date_posted,
     seniority       = EXCLUDED.seniority,
+    country         = EXCLUDED.country,
     last_seen_at    = now(),
     status          = 'open'
 """
