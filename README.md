@@ -31,6 +31,7 @@ Nothing here touches the `resume-optimizer` repo.
 job-crawler/
 ├── crawler/
 │   ├── src/pgpipe/            NEW — the entire Redis-free pipeline (jobs CLI)
+│   ├── src/report/            NEW — daily market report (separate job, aggregates only)
 │   ├── src/core/monitors/     reused verbatim from jobseek (the only reused code)
 │   ├── src/ ...               rest of jobseek, inert (see UPSTREAM_DRIFT.md §2)
 │   ├── data/companies.csv     ~500 companies (trimmed)
@@ -38,10 +39,12 @@ job-crawler/
 │   └── pyproject.toml         + `jobs = "src.pgpipe.cli:main"`
 ├── .github/workflows/
 │   ├── crawl-jobs.yml         cron every 6h: migrate -> sync -> run (+close+prune)
-│   └── cleanup-stale-jobs.yml cron daily: hard-delete postings unseen 5d
+│   ├── cleanup-stale-jobs.yml cron daily: hard-delete postings unseen 5d
+│   └── market-report.yml      cron daily: market report -> report_daily / report_weekly
 ├── search/jobs_search.sql     FTS functions on crawler.job_posting
 ├── search/jobs_search.js      node-postgres / supabase-js wrappers
 ├── tools/trim_csvs.py         regenerates the trimmed CSVs from upstream
+├── tools/build_report_data.py regenerates crawler/data/report/ + taxonomies
 ├── patches/                   the two diffs vs upstream (config, pyproject)
 ├── RUN_LOCAL.md               exact first-run commands
 └── UPSTREAM_DRIFT.md          every deviation from upstream
@@ -94,6 +97,72 @@ Clean re-scrape: `jobs migrate && jobs purge && jobs sync && jobs run`. See `RUN
 Indexes: PK; `unique(company_slug, url)`; `(company_slug)`, `(board_slug)`,
 `(status)`, `(last_seen_at desc)`, `(company_slug, first_seen_at desc)`,
 partial `(company_slug, external_id)`, GIN `(search_tsv)`.
+
+---
+
+## Market report (separate job)
+
+`.github/workflows/market-report.yml` runs daily at 01:13 UTC and builds a
+**report only** of the global job market — no job rows are stored and nothing
+appears in the webapp. It is fully independent of `crawl-jobs`: its own board
+list (`crawler/data/report/`, ~4.7k companies, all industries and roles), its
+own code (`crawler/src/report/`), its own schemas.
+
+```
+crawl  (6 parallel shards)   fetch boards WITH descriptions -> derive per-job
+                             attributes in memory -> shard parquet (runner disk)
+build                        merge shards -> dedupe -> FX to USD -> compare with
+                             yesterday -> rollup -> sections -> one transaction:
+                               report_daily.report   overwrite the single row
+                               report_weekly.report  fold the day into its ISO week
+```
+
+| table | rows | what's in it |
+|---|---|---|
+| `report_daily.report` | always 1 (`id = 1`) | today's report + day-over-day and vs-last-week deltas |
+| `report_weekly.report` | 1 per ISO week | the week compiled from its daily reports: per-day averages for stocks (jobs, companies), totals for flows (new, removed), salary percentiles from the merged daily histograms, deltas vs previous week / 4 / 12 weeks; `status` = `in_progress` until the next week starts, then `final` |
+
+Per job (derived in memory, then dropped): profile (occupation) and job family,
+seniority, years of experience, salary (structured or parsed from the
+description; annualised; converted to USD at that day's ECB rate), country /
+region / city, work mode, employment type, technologies, education, visa
+sponsorship, equity, clearance, language, posting age, company industry / size /
+age, ATS source.
+
+Report sections (JSONB, chart-ready `[{bucket, label, jobs, share_pct, new,
+removed, remote_pct, salary_n, salary_disclosure_pct, salary_avg_usd,
+salary_median_usd, salary_p10..p90_usd, yoe_median, d_jobs, d_jobs_pct, ...}]`):
+
+| column | contents |
+|---|---|
+| `kpi`, `kpi_deltas` | headline numbers; change vs previous day / week |
+| `profiles` | job families, profiles, top titles, seniority; risers/fallers (absolute and %), appeared/disappeared, for profiles, titles, countries, cities, technologies, companies, industries; profile × seniority / work mode, family × industry / company size / education |
+| `salary` | overall; salary by every core dimension; histograms ($10k bins) overall and per family / seniority / YOE / region / country / profile; premiums (remote vs onsite per profile, city / technology / industry / company-size premium indexes vs the same profile's median); local-currency medians by country and country × family; disclosure rates by country / ATS / company |
+| `experience` | YOE bands and exact years, salary curve by years, profile × YOE, family × YOE, seniority × YOE, country × YOE, entry-level share |
+| `geography` | regions, countries, top cities, multi-location jobs, profile × country, family × country, country × seniority |
+| `skills` | technologies, technology × family / YOE / country, technologies that appear together |
+| `companies` | top hiring companies, industries, company size and age |
+| `attributes` | work mode, employment type, education, visa, equity, clearance, language, ATS, posting age, how long removed jobs were open |
+| `coverage`, `data_quality` | boards ok/failed per ATS, coverage %, salary parse rates, thin-sample flags, FX used |
+
+Every salary figure carries its sample size (`salary_n`) and `salary_thin` when
+it rests on fewer than 30 salaries. Percentiles come from 1% log-scale
+histograms (4% in two-way tables), accurate to about ±0.5%.
+
+Read it with the service-role key (RLS on, no public policies), selecting the
+report columns — `rollup`, `baseline`, `job_state` and `prev_job_state` are
+machinery for the weekly fold and day-over-day comparisons.
+
+```bash
+cd crawler
+uv run --no-sync python -m src.report.cli crawl --shard 0 --shards 6 --out ../out
+uv run --no-sync python -m src.report.cli build --in ../out --shards 6 [--dry-run --out r.json]
+uv run --no-sync python -m src.report.cli show
+```
+
+Manual test run: Actions → market-report → *Run workflow* with
+`board_limit = 10` and `dry_run = true` — the report JSON is uploaded as an
+artifact and nothing is written to Supabase.
 
 ---
 
