@@ -1,0 +1,137 @@
+name: market-report
+
+# Daily global job-market REPORT — separate from crawl-jobs and the jobs board.
+# Crawls every job board in crawler/data/report/boards.csv (all industries, all
+# roles, with descriptions for salary / experience / skills), keeps nothing
+# per-job, and writes aggregates only:
+#   report_daily.report   exactly 1 row, overwritten every run
+#   report_weekly.report  1 row per ISO week, folded from each daily run
+# Nothing in the `crawler` or `public` schemas is read or written.
+#
+# 6 crawl shards run in parallel on separate runners (public repo -> free
+# minutes); the build job merges whatever shards finished, so one failed shard
+# yields a 'partial' day instead of no day.
+on:
+  schedule:
+    - cron: "13 1 * * *"     # 01:13 UTC daily, clear of crawl-jobs (:00) and cleanup (:27)
+  workflow_dispatch:
+    inputs:
+      board_limit:
+        description: "Boards per shard (0 = all). Use e.g. 10 for a quick test."
+        default: "0"
+      dry_run:
+        description: "Compute only — don't write to Supabase (report JSON is uploaded as an artifact)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: market-report
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REPORT_SHARDS: "6"
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    defaults:
+      run:
+        shell: bash
+        working-directory: crawler
+    env:
+      PGPIPE_CONCURRENCY: "12"
+      REPORT_BOARD_LIMIT: ${{ inputs.board_limit || '0' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv + Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies (locked)
+        run: uv sync --frozen
+
+      - name: Crawl shard ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          uv run --no-sync python -m src.report.cli crawl \
+            --shard "${{ matrix.shard }}" --shards "${REPORT_SHARDS}" --out ../out \
+            | tee ../out-summary.json
+
+      - name: Upload shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-shard-${{ matrix.shard }}
+          path: out/
+          retention-days: 3
+          if-no-files-found: error
+
+  build:
+    needs: crawl
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: crawler
+    env:
+      LOCAL_DATABASE_URL: ${{ secrets.LOCAL_DATABASE_URL }}
+      PGPIPE_SCHEMA: crawler
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv + Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies (locked)
+        run: uv sync --frozen
+
+      - name: Download shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: report-shard-*
+          path: out
+          merge-multiple: true
+
+      - name: Build report
+        run: |
+          set -euo pipefail
+          extra=()
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            extra=(--dry-run --out ../report.json)
+          fi
+          uv run --no-sync python -m src.report.cli build \
+            --in ../out --shards "${REPORT_SHARDS}" "${extra[@]}" | tee ../build.json
+
+      - name: Upload dry-run report
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-report-dry-run
+          path: report.json
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## market-report"
+            echo '```json'; cat ../build.json 2>/dev/null || echo '{}'; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
