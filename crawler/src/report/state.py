@@ -1,10 +1,13 @@
 """Day-over-day job identity, stored as one compressed blob in the daily row.
 
 Per open job we keep (hashed key, board hash, first day) — 16 bytes, no
-attributes. Comparing today's crawl with yesterday's blob gives exact new and
-removed counts and how long removed jobs were open. Jobs on boards that FAILED
-today are carried forward unchanged, so a flaky board doesn't show up as a
-wave of removals today and a wave of "new" jobs tomorrow.
+attributes — plus the set of boards that have ever crawled OK. Comparing
+today's crawl with yesterday's blob gives exact new and removed counts and how
+long removed jobs were open. Jobs on boards that FAILED today are carried
+forward unchanged, so a flaky board doesn't show up as a wave of removals today
+and a wave of "new" jobs tomorrow. Jobs on a board crawled OK for the first
+time (it failed on every earlier run, or was just added) are that board's
+baseline, not new jobs, so rising coverage doesn't inflate `new_jobs`.
 """
 
 from __future__ import annotations
@@ -12,9 +15,10 @@ from __future__ import annotations
 import struct
 import zlib
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-_MAGIC = b"RS1"
+_MAGIC = b"RS2"
+_MAGIC_V1 = b"RS1"  # no seen-boards list; readable, never written
 
 
 def board_hash(board_slug: str) -> int:
@@ -26,14 +30,21 @@ class JobState:
     keys: array  # 'q'
     boards: array  # 'i'
     first_day: array  # 'i'
+    seen_boards: array = field(default_factory=lambda: array("i"))  # boards ever crawled OK
 
     def __len__(self) -> int:
         return len(self.keys)
 
 
 def encode(state: JobState) -> bytes:
-    n = len(state.keys)
-    body = state.keys.tobytes() + state.boards.tobytes() + state.first_day.tobytes()
+    n, m = len(state.keys), len(state.seen_boards)
+    body = (
+        state.keys.tobytes()
+        + state.boards.tobytes()
+        + state.first_day.tobytes()
+        + struct.pack("<I", m)
+        + state.seen_boards.tobytes()
+    )
     return zlib.compress(_MAGIC + struct.pack("<I", n) + body, 6)
 
 
@@ -41,7 +52,7 @@ def decode(blob: bytes | None) -> JobState | None:
     if not blob:
         return None
     raw = zlib.decompress(bytes(blob))
-    if raw[:3] != _MAGIC:
+    if raw[:3] not in (_MAGIC, _MAGIC_V1):
         return None
     (n,) = struct.unpack("<I", raw[3:7])
     off = 7
@@ -53,7 +64,15 @@ def decode(blob: bytes | None) -> JobState | None:
     off += 4 * n
     first = array("i")
     first.frombytes(raw[off : off + 4 * n])
-    return JobState(keys, boards, first)
+    off += 4 * n
+    seen = array("i")
+    if raw[:3] == _MAGIC:
+        (m,) = struct.unpack("<I", raw[off : off + 4])
+        seen.frombytes(raw[off + 4 : off + 4 + 4 * m])
+    else:
+        # v1 blobs: every board holding a job had crawled OK at some point
+        seen = array("i", sorted(set(boards)))
+    return JobState(keys, boards, first, seen)
 
 
 # removed-job age, exact day counts capped at this value (mergeable histogram)
@@ -67,6 +86,7 @@ class Comparison:
     removed_days: dict[str, int]  # {days_open: count}
     carried: int  # jobs kept because their board failed today
     new_state: JobState
+    newly_covered: int = 0  # jobs on boards crawled OK for the first time
 
 
 def compare(
@@ -76,18 +96,27 @@ def compare(
     posted_days: list[int | None],
     failed_boards: set[int],
     today: int,
+    ok_boards: set[int] | None = None,
 ) -> Comparison:
+    """`ok_boards`: boards crawled OK today (default: those holding a job)."""
+    ok = set(boards) if ok_boards is None else ok_boards
     if prev is None:
         # Baseline run: no yesterday, so nothing is "new" (and nothing removed).
         is_new = [False] * len(keys)
         first = array("i", [min(today, pd) if pd is not None else today for pd in posted_days])
         return Comparison(
-            is_new, None, {}, 0, JobState(array("q", keys), array("i", boards), first)
+            is_new,
+            None,
+            {},
+            0,
+            JobState(array("q", keys), array("i", boards), first, array("i", sorted(ok))),
         )
 
     prev_first = dict(zip(prev.keys, prev.first_day, strict=True))
+    seen = set(prev.seen_boards)
     today_set = set(keys)
-    is_new = [k not in prev_first for k in keys]
+    is_new = [k not in prev_first and b in seen for k, b in zip(keys, boards, strict=True)]
+    newly_covered = sum(1 for b in boards if b not in seen)
     first = array(
         "i",
         [
@@ -117,5 +146,10 @@ def compare(
     new_boards.extend(carry_b)
     first.extend(carry_f)
     return Comparison(
-        is_new, removed, removed_days, len(carry_k), JobState(new_keys, new_boards, first)
+        is_new,
+        removed,
+        removed_days,
+        len(carry_k),
+        JobState(new_keys, new_boards, first, array("i", sorted(seen | ok))),
+        newly_covered,
     )
