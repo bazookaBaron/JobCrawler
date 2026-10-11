@@ -130,6 +130,10 @@ def coverage(statuses: list[dict], shards: int, got: set[int], raw: int, unique:
     }
 
 
+def ok_board_hashes(statuses: list[dict]) -> set[int]:
+    return {state.board_hash(s["board_slug"]) for s in statuses if s["status"] == "ok"}
+
+
 def failed_board_hashes(statuses: list[dict]) -> set[int]:
     ok = {s["board_slug"] for s in statuses if s["status"] == "ok"}
     return {state.board_hash(b["board_slug"]) for b in load_boards() if b["board_slug"] not in ok}
@@ -272,6 +276,7 @@ def compute_day(
         df.get_column("posted_day").to_list(),
         failed,
         today_n,
+        ok_board_hashes(statuses),
     )
     df = df.with_columns(pl.Series("is_new", cmp.is_new, dtype=pl.Boolean))
     df = enrich(df, usd_per, today_n)

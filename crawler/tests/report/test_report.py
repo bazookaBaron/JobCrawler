@@ -117,6 +117,32 @@ def test_state_roundtrip_and_compare():
     assert sorted(cmp.new_state.keys) == [2, 3, 4]
 
 
+def test_newly_covered_board_is_baseline_not_new():
+    # day 1: board 30 failed, so it has no jobs and was never crawled OK
+    d1 = state.compare(None, [1, 2], [10, 10], [None, None], {30}, 100, {10})
+    prev = state.decode(state.encode(d1.new_state))
+    assert list(prev.seen_boards) == [10]
+    # day 2: board 30 works for the first time; only job 3 (board 10) is new
+    cmp = state.compare(prev, [1, 2, 3, 7, 8], [10, 10, 10, 30, 30], [None] * 5, set(), 101)
+    assert cmp.is_new == [False, False, True, False, False]
+    assert cmp.newly_covered == 2 and cmp.removed == 0
+    # day 3: board 30 is now known, so its new postings count as new
+    prev = state.decode(state.encode(cmp.new_state))
+    cmp = state.compare(prev, [1, 2, 3, 7, 8, 9], [10, 10, 10, 30, 30, 30], [None] * 6, set(), 102)
+    assert cmp.is_new == [False] * 5 + [True] and cmp.newly_covered == 0
+
+
+def test_v1_state_blob_still_decodes():
+    import struct
+    import zlib
+    from array import array
+
+    keys, boards, first = array("q", [1, 2]), array("i", [10, 20]), array("i", [5, 5])
+    raw = b"RS1" + struct.pack("<I", 2) + keys.tobytes() + boards.tobytes() + first.tobytes()
+    st = state.decode(zlib.compress(raw))
+    assert list(st.keys) == [1, 2] and sorted(st.seen_boards) == [10, 20]
+
+
 # --- derive / rollup / sections ---------------------------------------------------
 def _job(i: int, title: str, loc: str, desc: str, sal: dict | None = None) -> DiscoveredJob:
     return DiscoveredJob(

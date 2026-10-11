@@ -69,6 +69,7 @@ async def _cmd_build(in_dir: Path, shards: int, day: date, dry_run: bool, out: P
             **result["quality"],
             "baseline_run": prev_state is None,
             "jobs_carried_from_failed_boards": result["comparison"].carried,
+            "jobs_from_newly_covered_boards": result["comparison"].newly_covered,
         }
 
         if dry_run:
