@@ -1,12 +1,14 @@
 """Lightweight, offline location -> country classifier.
 
-Maps a job posting's free-text location string(s) to 'US' | 'IN' | 'other'.
+Maps a job posting's free-text location string(s) to
+'US' | 'IN' | 'remote' | 'other'.
 No external geocoding calls — pure string matching against curated signal
 lists, O(1) per posting (all lookups are against small fixed tuples/sets).
 Wired into ingest.py at the same point location_type is captured, so every
 newly-ingested posting gets classified at insert time. Deliberately
 conservative: an unmatched or ambiguous string falls back to 'other' rather
-than guessing.
+than guessing -- except when the location (or title) says the role is
+remote / worldwide / anywhere, which is kept as its own 'remote' bucket.
 """
 from __future__ import annotations
 
@@ -79,6 +81,10 @@ _INDIA_MARKERS = (
 # All word-bounded (see _US_MARKERS_SUBSTR/_WORD comment) — bare "in"/"india"
 # would otherwise substring-match inside "Indiana" etc.
 
+_REMOTE_RE = re.compile(
+    r"\b(remote|worldwide|work from home|wfh|anywhere|global(ly)?|distributed)\b", re.I
+)
+
 _STATE_ABBR_RE = re.compile(r",\s*([a-z]{2})\b")
 
 
@@ -99,8 +105,16 @@ def _has_us_state_abbr(blob: str) -> bool:
     return False
 
 
-def classify_country(location: str | None, locations: list[str] | None = None) -> str | None:
-    """Classify a posting's location into 'US' | 'IN' | 'other'.
+def classify_country(
+    location: str | None,
+    locations: list[str] | None = None,
+    title: str | None = None,
+) -> str | None:
+    """Classify a posting's location into 'US' | 'IN' | 'remote' | 'other'.
+
+    'remote' is returned only when no US/IN signal was found but the location
+    (or title) says remote / worldwide / anywhere. A US- or India-scoped remote
+    role ("Remote - US") stays 'US' / 'IN'.
 
     Checks India signals first (city/country names that never collide with
     US state abbreviations), then US signals (country markers, major
@@ -111,12 +125,13 @@ def classify_country(location: str | None, locations: list[str] | None = None) -
     candidates = [location] if location else []
     if locations:
         candidates.extend(loc for loc in locations if loc)
+    title_remote = bool(title and _REMOTE_RE.search(title))
     if not candidates:
-        return None
+        return "remote" if title_remote else None
 
     blob = _norm(" | ".join(candidates))
     if not blob:
-        return None
+        return "remote" if title_remote else None
 
     for city in _INDIA_CITIES:
         if _has_word(blob, city):
@@ -140,4 +155,6 @@ def classify_country(location: str | None, locations: list[str] | None = None) -
     if _has_us_state_abbr(blob):
         return "US"
 
+    if title_remote or _REMOTE_RE.search(blob):
+        return "remote"
     return "other"

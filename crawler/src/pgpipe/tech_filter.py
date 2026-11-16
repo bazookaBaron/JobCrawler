@@ -3,6 +3,9 @@ applied & security research, and quant roles. Applied in ingest.py before
 upsert when PGPIPE_TECH_ONLY=1 (the default).
 
 BLOCK wins: a title that matches both an ALLOW and a BLOCK pattern is dropped.
+Exception: the *soft* blocks (marketing, "account") are overridden by a strong
+tech term, so "Marketing Technology Engineer" / "Account Data Engineer" survive
+while "Marketing Manager" / "Account Executive" do not.
 """
 from __future__ import annotations
 
@@ -53,17 +56,49 @@ _ALLOW_SRC = [
     r"incident response", r"cryptography engineer", r"security software engineer",
 ]
 
+# --- ALLOW (generic): matched against the TITLE only, never the department,
+# so an "Engineering" department doesn't admit "Office Manager". -------------
+_ALLOW_GENERIC_SRC = [
+    r"\bdevelopers?\b", r"\bengineers?\b", r"\bengineering\b", r"\bprogrammers?\b",
+    r"member of technical staff", r"\bmts\b", r"\bsde\b", r"\bswe\b",
+    r"\barchitects?\b", r"\bdevops\b", r"\bsre\b",
+    r"data (scientist|engineer|analyst)", r"\bml\b", r"\bai\b",
+    r"analytics engineer", r"founding engineer", r"product engineer",
+    r"\bqa\b", r"\bsdet\b", r"test engineer",
+]
+
 # --- BLOCK: drop even if an ALLOW matched ---------------------------------
 _BLOCK_SRC = [
     r"sales engineer", r"solutions engineer", r"customer engineer",
     r"field engineer", r"support engineer", r"implementation engineer",
-    r"\baccount\b", r"recruit", r"marketing", r"collections",
+    r"recruit", r"collections",
     r"financial (advis|analyst|planner|consultant|controller|servic|reporting)",
     r"relationship manager", r"\bbranch\b",
+    # non-software engineering disciplines now that bare "engineer" is allowed
+    r"\b(civil|structural|chemical|petroleum|mining|stationary|operating) engineer",
+]
+
+# Soft blocks: dropped unless a STRONG tech term is also present.
+_SOFT_BLOCK_SRC = [r"\baccount\b", r"marketing"]
+
+# Terms strong enough to override a soft block. Deliberately specific: a bare
+# "engineer" is NOT enough ("Marketing Engineer" is ambiguous); a qualified one
+# ("technology engineer", "software engineer") is.
+_STRONG_SRC = [
+    r"\bsoftware\b", r"\bdevelopers?\b", r"\bprogrammers?\b", r"\bdevops\b",
+    r"\bsre\b", r"\bsdet\b", r"\bsde\b", r"\bswe\b", r"\bmts\b",
+    r"member of technical staff", r"data (engineer|scientist)", r"machine learning",
+    r"\b(ml|ai) engineer",
+    r"\b(technology|technical|platform|data|systems?|infrastructure|back[- ]?end|"
+    r"front[- ]?end|full[- ]?stack|security|cloud|analytics|product) engineer",
+    r"engineering manager", r"\barchitect\b",
 ]
 
 _ALLOW = [re.compile(p, re.I) for p in _ALLOW_SRC]
+_ALLOW_GENERIC = [re.compile(p, re.I) for p in _ALLOW_GENERIC_SRC]
 _BLOCK = [re.compile(p, re.I) for p in _BLOCK_SRC]
+_SOFT_BLOCK = [re.compile(p, re.I) for p in _SOFT_BLOCK_SRC]
+_STRONG = [re.compile(p, re.I) for p in _STRONG_SRC]
 
 
 def is_tech_role(title: str | None, department: str | None = None) -> bool:
@@ -73,4 +108,8 @@ def is_tech_role(title: str | None, department: str | None = None) -> bool:
         return False
     if any(p.search(text) for p in _BLOCK):
         return False
-    return any(p.search(text) for p in _ALLOW)
+    if any(p.search(text) for p in _SOFT_BLOCK) and not any(p.search(text) for p in _STRONG):
+        return False
+    if any(p.search(text) for p in _ALLOW):
+        return True
+    return any(p.search(title or "") for p in _ALLOW_GENERIC)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
@@ -93,6 +94,21 @@ def _parse_salary(salary_range: dict | None) -> dict | None:
     }
 
 
+def _created_at_iso(posting: dict) -> str | None:
+    """Lever `createdAt` is epoch milliseconds -> ISO-8601 UTC string."""
+    raw = posting.get("createdAt")
+    try:
+        ms = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if ms <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _parse_job(posting: dict) -> DiscoveredJob | None:
     url = posting.get("hostedUrl")
     if not url:
@@ -122,6 +138,7 @@ def _parse_job(posting: dict) -> DiscoveredJob | None:
         locations=all_locations or None,
         employment_type=categories.get("commitment"),
         job_location_type=posting.get("workplaceType"),
+        date_posted=_created_at_iso(posting),
         base_salary=_parse_salary(posting.get("salaryRange")),
         metadata=metadata or None,
     )
