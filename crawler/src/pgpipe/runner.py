@@ -3,9 +3,10 @@
 reclaim stale claims -> enqueue every enabled board -> N worker coroutines
 claim (FOR UPDATE SKIP LOCKED) + crawl + upsert (+ close jobs missing from a
 successfully crawled board) -> close stale (36h / 30h linkedin) -> cap per
-company (closes, never deletes) -> hard-delete rows closed > 7d -> record
+company (closes, never deletes) -> expire rows outside the keep window (after
+seen_posting remembers them) -> row cap -> prune seen_posting -> record
 board health + log disabled/failing boards -> write a crawl_run summary row.
-Open rows are never deleted, so ids stay stable.
+Inside the keep window (PGPIPE_KEEP_DAYS) ids stay stable.
 """
 from __future__ import annotations
 
@@ -127,7 +128,9 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
     remaining = await pool.fetchval("SELECT count(*) FROM crawl_queue WHERE status='pending'")
     closed = stats["closed_missing"] + await cleanup.close_stale(pool)
     pruned = await cleanup.prune_per_company(pool)
-    deleted_old = await cleanup.hard_delete_stale(pool)  # only rows closed > 7d
+    deleted_old = await cleanup.hard_delete_stale(pool)  # outside the keep window
+    capped = await cleanup.enforce_row_cap(pool)
+    seen_pruned = await cleanup.prune_seen(pool)
     health = await _record_board_health(pool, run_id, stats["gone"])
 
     kept = stats["upserted"]
@@ -135,7 +138,7 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
     seen = kept + dropped
     notes = (
         f"reclaimed={reclaimed} enqueued={enqueued} remaining_pending={remaining} "
-        f"deleted_old={deleted_old} closed_missing={stats['closed_missing']} "
+        f"deleted_old={deleted_old} capped={capped} seen_pruned={seen_pruned} closed_missing={stats['closed_missing']} "
         f"boards_gone={len(stats['gone'])} boards_failing={len(health['failing'])} "
         f"tech_filter: kept={kept} dropped_nontech={dropped} "
         f"({round(100.0 * kept / seen, 1) if seen else 0.0}% kept of {seen} seen)"
@@ -171,6 +174,8 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
         "postings_dropped_nontech": dropped,
         "postings_closed": closed,
         "postings_deleted_old": deleted_old,
+        "postings_capped": capped,
+        "seen_pruned": seen_pruned,
         "boards_disabled_gone": stats["gone"],
         "boards_failing": health["failing"],
         "postings_pruned": pruned,

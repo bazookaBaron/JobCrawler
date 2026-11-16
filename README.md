@@ -64,7 +64,8 @@ uv run --no-sync jobs sync                     data/*.csv -> crawler.company / j
 uv run --no-sync jobs run [--minutes 20]       one bounded crawl pass
 uv run --no-sync jobs close-stale [--hours 36] status='closed' for postings unseen N hours (30h for linkedin)
 uv run --no-sync jobs prune [--cap 400]        keep newest N OPEN postings per company (extras are closed)
-uv run --no-sync jobs hard-delete [--days 7]   DELETE rows CLOSED more than N days ago (never open rows)
+uv run --no-sync jobs hard-delete [--days 7]   DELETE rows outside the keep window (PGPIPE_KEEP_DAYS) or CLOSED > N days (remembered in seen_posting first)
+uv run --no-sync jobs retain                   hard-delete + row cap (PGPIPE_MAX_ROWS) + prune seen_posting (PGPIPE_SEEN_TTL_DAYS)
 uv run --no-sync jobs build-feed               SELECT crawler.build_feed(): LinkedIn/ATS dedupe + rebuild crawler.job_feed
 uv run --no-sync jobs stats                    row counts
 ```
@@ -72,8 +73,8 @@ uv run --no-sync jobs stats                    row counts
 `jobs run` = reclaim stale claims → enqueue every enabled board → N workers
 claim + fetch + **tech-filter + seniority-tag** + upsert (closing jobs that vanished
 from a successfully crawled board) → close-stale (36h) → prune (closes) →
-hard-delete rows closed > 7 days. Open rows are never deleted, so ids and
-`posted_at` are stable. Run `jobs build-feed` afterwards (the workflows do).
+expire rows older than the keep window (2 days) / closed > 7 days → row cap →
+prune `seen_posting`. Inside the window ids and `posted_at` are stable. Run `jobs build-feed` afterwards (the workflows do).
 Clean re-scrape: `jobs migrate && jobs purge && jobs sync && jobs run`. See `RUN_LOCAL.md`.
 
 ---
@@ -213,11 +214,44 @@ The crawler never needs the `postgres` password except to run migrations.
 
 ### Retention model
 
-Open rows are never hard-deleted, so row ids and `posted_at` are stable. A job is
-closed when (a) its board was crawled successfully and the job was missing, or
-(b) it has not been seen for 36 h (30 h for `source='linkedin'`). Rows closed for
-more than 7 days are deleted. Per company only the newest 400 open rows are kept
-(the rest are closed). A board that returns `BoardGoneError` is disabled and
+`crawler.job_posting` is a **short window**, not an archive: the site only shows
+the last 24 h and the digest needs ~1 day, so only rows with `eff_at` newer than
+`PGPIPE_KEEP_DAYS` (default **2**) are kept, open or closed. Inside the window ids
+and `posted_at` are stable. A job is closed when (a) its board was crawled
+successfully and the job was missing, or (b) it has not been seen for 36 h (30 h
+for `source='linkedin'`); closed rows go after 7 days or the keep window,
+whichever is sooner. Per company only the newest 400 open rows are kept (the rest
+are closed).
+
+To stop expired jobs coming back as "new", the tiny `crawler.seen_posting` table
+(`key uuid PK, first_seen_at, posted_at, last_seen_at`) remembers every job. `key`
+= `crawler.posting_key(...)` = `md5(...)::uuid` of `'li:'||linkedin_job_id`, else
+`'x:'||source||'|'||company_slug||'|'||external_id`, else
+`'u:'||company_slug||'|'||canonical_url` (Python mirror: `keys.posting_key`).
+Ingest (board crawl and the LinkedIn upsert) first touches `seen_posting`, then
+inserts a job only if `COALESCE(posted_at, first_seen_at)` is inside the keep
+window (a LinkedIn repost with `reposted_at` inside the window is still kept) and
+takes `first_seen_at`/`posted_at` from `seen_posting`, so undated jobs never get a
+new date and the alert digest (which uses `first_seen_at`) never sees a repost or
+re-listed job as brand new. Retention writes a row into `seen_posting` *before*
+deleting it. `PGPIPE_MAX_ROWS` (60000) is a safety cap (oldest `eff_at` deleted and
+logged) and `seen_posting` rows unseen for `PGPIPE_SEEN_TTL_DAYS` (45) are pruned.
+Config: `PGPIPE_KEEP_DAYS`, `PGPIPE_MAX_ROWS`, `PGPIPE_SEEN_TTL_DAYS`
+(`PGPIPE_DELETE_AFTER_DAYS` was unused and is removed).
+
+**Storage estimate** (Supabase free tier = 500 MB). `job_posting` measures ~3.7 KB
+per row including indexes. With ~4,100 boards the tech-filtered open set is roughly
+60-100k jobs, but only ~5-8% are new per day, so a 2-day window holds about
+8-16k rows, i.e. **30-60 MB** at steady state (versus 220-370 MB for keeping every
+open job, which would eat most of the database). The first crawl after deploying
+inserts every *undated* job once (their first-seen date is "now"), so expect a
+one-off spike of up to the 60k cap (about 220 MB) that drains within 2 days.
+`seen_posting` costs ~100 B per key including its primary-key index: ~150-250k keys
+over the 45-day TTL, i.e. **15-25 MB**. Expected total about 50-90 MB steady state.
+Rows deleted by the first retention run free space for reuse but do not shrink the
+file; run `VACUUM FULL crawler.job_posting;` once to get the current 155 MB back.
+
+A board that returns `BoardGoneError` is disabled and
 logged in `crawler.board_health`; boards failing 5+ runs in a row are logged
 there too, and both are listed at the end of every `jobs run` (and in the job
 summary).

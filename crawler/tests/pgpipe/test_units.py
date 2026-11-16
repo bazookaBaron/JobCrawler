@@ -11,7 +11,7 @@ from src.core.monitors.lever import _created_at_iso
 from src.pgpipe.country import classify_country
 from src.pgpipe.feedref import cooldown_order
 from src.pgpipe.ingest import _dedupe_records, _to_record
-from src.pgpipe.keys import dedupe_key, norm_city, norm_company_key, norm_title
+from src.pgpipe.keys import dedupe_key, norm_city, norm_company_key, norm_title, posting_key
 from src.pgpipe.posted_at import is_relative_date, parse_posted_at
 from src.pgpipe.tech_filter import is_tech_role
 from src.pgpipe.urlnorm import canonical_url
@@ -233,3 +233,16 @@ def test_cooldown_limit_is_prefix():
     full = cooldown_order(keys)
     assert cooldown_order(keys, limit=20) == full[:20]
     assert cooldown_order([]) == []
+
+
+def test_posting_key_identity_rules():
+    import uuid
+    a = posting_key("42", "linkedin", "acme", None, "https://www.linkedin.com/jobs/view/42/")
+    assert isinstance(a, uuid.UUID)
+    # linkedin id wins over everything else; ext id beats url; url is the fallback
+    assert a == posting_key("42", "x", "y", "ext", "other")
+    b = posting_key(None, "greenhouse", "acme", "gh:1", "https://a/1")
+    assert b == posting_key(None, "greenhouse", "acme", "gh:1", "https://a/moved")
+    assert b != posting_key(None, "lever", "acme", "gh:1", "https://a/1")
+    c = posting_key(None, "greenhouse", "acme", None, "https://a/1")
+    assert c != b and c == posting_key(None, "lever", "acme", "", "https://a/1")

@@ -84,19 +84,24 @@ class Settings:
     )
     priority_weight: float = _float("PGPIPE_PRIORITY_WEIGHT", 0.7)
 
-    # Retention. Open rows are NEVER hard-deleted (ids and posted_at must stay
-    # stable). A posting is closed when (a) its board was crawled successfully
-    # this run and it was missing, or (b) it has not been seen for
-    # `close_after_hours` (boards crawl every 12h -> 36h) /
-    # `close_after_hours_linkedin` (LinkedIn every 2h -> 30h). Only rows closed
-    # more than `max_age_days` (7) days ago are hard-deleted.
+    # Retention (see src/pgpipe/cleanup.py). job_posting only keeps the last
+    # `keep_days` (2) days of rows, open OR closed (by eff_at); expired rows are
+    # deleted AFTER crawler.seen_posting remembers them, and are not re-inserted.
+    # A job is closed when its board was crawled successfully this run and it was
+    # missing, or when unseen for `close_after_hours` (boards crawl every 12h ->
+    # 36) / `close_after_hours_linkedin` (LinkedIn every 2h -> 30). Closed rows
+    # are deleted after `max_age_days` or the keep window, whichever is sooner.
+    # `max_rows` is a hard safety cap on job_posting (oldest eff_at deleted);
+    # seen_posting entries unseen for `seen_ttl_days` are pruned.
+    keep_days: int = _int("PGPIPE_KEEP_DAYS", 2)
+    max_rows: int = _int("PGPIPE_MAX_ROWS", 60000)
+    seen_ttl_days: int = _int("PGPIPE_SEEN_TTL_DAYS", 45)
     per_company_cap: int = _int("PGPIPE_PER_COMPANY_CAP", 400)
     close_after_hours: int = (
         _int("PGPIPE_CLOSE_AFTER_DAYS", 0) * 24 or _int("PGPIPE_CLOSE_AFTER_HOURS", 36)
     )
     close_after_hours_linkedin: int = _int("PGPIPE_CLOSE_AFTER_HOURS_LINKEDIN", 30)
-    max_age_days: int = _int("PGPIPE_MAX_AGE_DAYS", 7)  # days a CLOSED row is kept
-    delete_after_days: int = _int("PGPIPE_DELETE_AFTER_DAYS", 7)
+    max_age_days: int = _int("PGPIPE_MAX_AGE_DAYS", 7)  # days a CLOSED row is kept (max)
 
     worker_id: str = os.environ.get("PGPIPE_WORKER_ID", "").strip() or f"gha-{os.getpid()}"
 

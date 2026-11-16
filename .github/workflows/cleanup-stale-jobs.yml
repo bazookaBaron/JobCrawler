@@ -1,11 +1,13 @@
 name: cleanup-stale-jobs
 
-# Daily safety net + analytics snapshot. NOTHING here deletes an open row:
+# Daily safety net + analytics snapshot:
 #   1. snapshot-market  -> public.jobs_market_snapshot_daily (long-term record)
 #   2. close-stale      -> close open rows unseen for 36h (30h for LinkedIn)
 #   3. prune            -> keep the newest 400 OPEN rows per company (closes the rest)
-#   4. hard-delete      -> DELETE only rows that have been CLOSED for > 7 days
-#   5. build-feed       -> refresh crawler.job_feed after the closes above
+#   4. retain           -> delete rows older than PGPIPE_KEEP_DAYS (2) (open or closed;
+#                          remembered in crawler.seen_posting first), enforce the
+#                          PGPIPE_MAX_ROWS cap, prune seen_posting after 45 days
+#   5. build-feed       -> refresh crawler.job_feed after the changes above
 # `crawl-jobs` performs 2-4 at the end of every pass; this workflow is the
 # fallback if that one is paused, and the only place the daily snapshot is taken.
 on:
@@ -29,7 +31,10 @@ jobs:
       PGPIPE_SCHEMA: crawler
       PGPIPE_CLOSE_AFTER_HOURS: "36"
       PGPIPE_CLOSE_AFTER_HOURS_LINKEDIN: "30"
-      PGPIPE_MAX_AGE_DAYS: "7"          # a CLOSED row is deleted after N days
+      PGPIPE_MAX_AGE_DAYS: "7"          # a CLOSED row is deleted after N days (or KEEP_DAYS)
+      PGPIPE_KEEP_DAYS: "2"             # job_posting window; older rows -> seen_posting only
+      PGPIPE_MAX_ROWS: "60000"          # safety cap on job_posting
+      PGPIPE_SEEN_TTL_DAYS: "45"
       PGPIPE_PER_COMPANY_CAP: "400"
 
     steps:
@@ -50,12 +55,12 @@ jobs:
           set -euo pipefail
           uv run --no-sync jobs snapshot-market | tee ../snapshot.json
 
-      - name: Close stale, cap per company, delete rows closed > 7 days
+      - name: Close stale, cap per company, expire old rows
         run: |
           set -euo pipefail
           uv run --no-sync jobs close-stale | tee ../cleanup.json
           uv run --no-sync jobs prune | tee -a ../cleanup.json
-          uv run --no-sync jobs hard-delete --days "${PGPIPE_MAX_AGE_DAYS}" | tee -a ../cleanup.json
+          uv run --no-sync jobs retain | tee -a ../cleanup.json
 
       - name: Rebuild feed
         run: |

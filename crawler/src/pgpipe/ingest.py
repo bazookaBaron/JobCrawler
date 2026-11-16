@@ -11,6 +11,7 @@ import asyncpg
 import httpx
 
 from src.core.monitors import BoardGoneError, DiscoveredJob, get_discoverer
+from src.pgpipe.config import settings
 from src.pgpipe.country import classify_country
 from src.pgpipe.monitors_workday import discover_workday
 from src.pgpipe.posted_at import is_relative_date, parse_posted_at
@@ -112,16 +113,38 @@ def _to_record(
     )
 
 
-# posted_at: first insert uses the real date, else first_seen (now()). On
-# conflict a real absolute date wins; undated/relative rows keep what we had.
+# seen_posting is touched for EVERY crawled job (even ones skipped as too old)
+# so its TTL keeps counting from the last time a board still listed it.
+# posted_at: a real absolute date wins; an undated/relative one only seeds it
+# (keep_existing) so dates never reset.
+# $1 company, $2 source, $3 external_id, $4 url, $5 posted (nullable), $6 keep_existing.
+_TOUCH_SEEN = """
+INSERT INTO seen_posting (key, first_seen_at, posted_at, last_seen_at)
+VALUES (posting_key(NULL, $2::text, $1::text, $3::text, $4::text), now(), $5::timestamptz, now())
+ON CONFLICT (key) DO UPDATE SET
+    last_seen_at = now(),
+    posted_at = CASE WHEN $6::boolean
+                     THEN COALESCE(seen_posting.posted_at, EXCLUDED.posted_at)
+                     ELSE COALESCE(EXCLUDED.posted_at, seen_posting.posted_at) END
+"""
+
+# Insert only jobs whose seen_posting date (real posted date, else first seen) is
+# inside the keep window. first_seen_at / posted_at come from seen_posting so an
+# expired-then-reappearing job never looks new. On conflict a real absolute date
+# wins; undated/relative rows keep what we had.
+# $1..$15 columns, $16 run_id, $17 keep_existing, $18 keep_days.
 _UPSERT = """
 INSERT INTO job_posting
     (company_slug, board_slug, source, external_id, url, title, titles,
      location, locations, location_type, employment_type, department, date_posted,
      seniority, country, posted_at, first_seen_at, last_seen_at, status,
      last_seen_run_id)
-VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10,$11,$12,$13,$14,$15,
-        COALESCE($16, now()), now(), now(), 'open', $18)
+SELECT $1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::jsonb,
+       $8::text,$9::jsonb,$10::text,$11::text,$12::text,$13::text,$14::text,$15::text,
+       COALESCE(s.posted_at, s.first_seen_at), s.first_seen_at, now(), 'open', $16::bigint
+FROM seen_posting s
+WHERE s.key = posting_key(NULL, $3::text, $1::text, $4::text, $5::text)
+  AND COALESCE(s.posted_at, s.first_seen_at) >= now() - make_interval(days => $18::int)
 ON CONFLICT (company_slug, url) DO UPDATE SET
     board_slug       = EXCLUDED.board_slug,
     source           = EXCLUDED.source,
@@ -198,6 +221,7 @@ async def crawl_board(
     board: asyncpg.Record,
     http: httpx.AsyncClient,
     run_id: int | None = None,
+    keep_days: int | None = None,
 ) -> dict:
     """Fetch + upsert one board. Returns counts (+ "gone" when the board was
     retired). Raises on failure (caller records + retries via the queue).
@@ -262,7 +286,12 @@ async def crawl_board(
                     [r[0] for r in with_ext], [r[2] for r in with_ext],
                     [r[3] for r in with_ext], [r[4] for r in with_ext],
                 )
-            await conn.executemany(_UPSERT, records)
+            kd = int(keep_days if keep_days is not None else settings.keep_days)
+            # r: 0 company 2 source 3 ext 4 url 15 posted 16 keep_existing 17 run_id
+            await conn.executemany(
+                _TOUCH_SEEN, [(r[0], r[2], r[3], r[4], r[15], r[16]) for r in records]
+            )
+            await conn.executemany(_UPSERT, [r[:15] + (r[17], r[16], kd) for r in records])
         if complete:
             res = await conn.execute(_CLOSE_MISSING, board["board_slug"], run_id)
             closed_missing = int(res.split()[-1]) if res and res.startswith("UPDATE") else 0

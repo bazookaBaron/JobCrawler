@@ -333,12 +333,13 @@ class Stats:
     details: int = 0
     aborted: bool = False
     skipped_queries: int = 0
+    skipped_old: int = 0
 
     def line(self) -> str:
         filt = sum(self.filtered.values())
         return (
             f"requests={self.requests} cards={self.cards} unique={self.unique} kept={self.kept} "
-            f"new={self.new} updated={self.updated} reposted={self.reposted} "
+            f"new={self.new} updated={self.updated} reposted={self.reposted} skipped_old={self.skipped_old} "
             f"filtered_out={filt} {self.filtered or ''} blocked={self.blocked} "
             f"details={self.details} aborted={self.aborted}"
         )
@@ -451,13 +452,46 @@ def company_sql(schema: str) -> str:
     )
 
 
-def posting_sql(schema: str) -> str:
+def _keep_days(keep_days: int | None) -> int:
+    if keep_days is not None:
+        return int(keep_days)
+    try:
+        return int(os.environ.get("PGPIPE_KEEP_DAYS", "").strip() or 2)
+    except ValueError:
+        return 2
+
+
+def seen_sql(schema: str) -> str:
+    """Touch crawler.seen_posting for a card ($1 linkedin id, $2 company slug, $3 url,
+    $4 posted_at). The first posted estimate wins (relative 'N hours ago' text drifts)."""
+    s = f"{schema}.seen_posting"
+    return (
+        f"INSERT INTO {s} (key, first_seen_at, posted_at, last_seen_at) "
+        f"VALUES ({schema}.posting_key($1::text, 'linkedin', $2::text, NULL, $3::text), "
+        "now(), $4::timestamptz, now()) "
+        f"ON CONFLICT (key) DO UPDATE SET last_seen_at = now(), "
+        f"posted_at = COALESCE({s}.posted_at, EXCLUDED.posted_at)"
+    )
+
+
+def posting_sql(schema: str, keep_days: int | None = None) -> str:
+    """Insert a card unless it is older than the keep window (PGPIPE_KEEP_DAYS, 2).
+    seen_posting must already hold the card (see seen_sql). A job whose seen_posting
+    date is outside the window is still inserted when it was REPOSTED inside the
+    window; first_seen_at always comes from seen_posting, so alerts don't treat a
+    repost as brand new. Returns no row when skipped."""
     t = f"{schema}.job_posting"
+    win = f"now() - make_interval(days => {_keep_days(keep_days)})"
     return (
         f"INSERT INTO {t} (company_slug, company_name, title, url, linkedin_job_id, location, "
         "location_type, seniority, country, apply_url, posted_at, reposted_at, source, status, "
         "first_seen_at, last_seen_at) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE($11, now()),$12,'linkedin','open',now(),now()) "
+        "SELECT $1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,"
+        "COALESCE($11::timestamptz, s.posted_at, s.first_seen_at),$12::timestamptz,"
+        "'linkedin','open',s.first_seen_at,now() "
+        f"FROM {schema}.seen_posting s "
+        f"WHERE s.key = {schema}.posting_key($5::text, 'linkedin', $1::text, NULL, $4::text) "
+        f"AND (COALESCE(s.posted_at, s.first_seen_at) >= {win} OR $12::timestamptz >= {win}) "
         "ON CONFLICT (linkedin_job_id) WHERE linkedin_job_id IS NOT NULL DO UPDATE SET "
         "last_seen_at = now(), status = 'open', "
         f"reposted_at = COALESCE(EXCLUDED.reposted_at, {t}.reposted_at), "
@@ -528,6 +562,7 @@ async def persist(
     stats: Stats,
     *,
     details: Callable[[list[Card]], None] | None = None,
+    keep_days: int | None = None,
 ) -> int:
     """Upsert companies + postings in one transaction, then build_feed(). Returns feed size."""
     import asyncpg
@@ -539,6 +574,7 @@ async def persist(
             details([c for c in cards if c.job_id not in existing])
         company_rows = {slugify(c.company_name or ""): c.company_name for c in cards}
         company_rows.pop("", None)
+        seen_q, post_q = seen_sql(schema), posting_sql(schema, keep_days)
         async with conn.transaction():
             await conn.executemany(company_sql(schema), list(company_rows.items()))
             for c in cards:
@@ -547,8 +583,11 @@ async def persist(
                     continue
                 old = existing.get(c.job_id)
                 rep = stable_reposted_at(c, old)
-                inserted = await conn.fetchval(posting_sql(schema), *posting_args(c, rep))
-                if inserted:
+                await conn.execute(seen_q, c.job_id, slug, c.url, c.posted_at)
+                inserted = await conn.fetchval(post_q, *posting_args(c, rep))
+                if inserted is None:
+                    stats.skipped_old += 1      # outside the keep window: not stored
+                elif inserted:
                     stats.new += 1
                 else:
                     stats.updated += 1

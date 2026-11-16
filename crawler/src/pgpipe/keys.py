@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import uuid
 
 _SUFFIX_RE = re.compile(r"\b(inc|llc|ltd|pvt|private|limited|technologies|corp)\b")
 _NON_ALNUM = re.compile(r"[^a-z0-9]")
@@ -32,3 +33,20 @@ def norm_city(location: str | None) -> str:
 def dedupe_key(company_key: str, title: str | None, location: str | None) -> str:
     raw = f"{company_key}|{norm_title(title)}|{norm_city(location)}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def posting_key(
+    linkedin_job_id: str | None,
+    source: str | None,
+    company_slug: str | None,
+    external_id: str | None,
+    url: str | None,
+) -> uuid.UUID:
+    """Stable identity of a posting (mirror of SQL `{schema}.posting_key`)."""
+    if linkedin_job_id:
+        raw = f"li:{linkedin_job_id}"
+    elif external_id:
+        raw = f"x:{source or ''}|{company_slug or ''}|{external_id}"
+    else:
+        raw = f"u:{company_slug or ''}|{url or ''}"
+    return uuid.UUID(hashlib.md5(raw.encode("utf-8")).hexdigest())

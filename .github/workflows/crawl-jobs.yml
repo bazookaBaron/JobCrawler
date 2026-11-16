@@ -6,12 +6,14 @@ name: crawl-jobs
 # the dedicated `crawler` Postgres schema. Then `jobs build-feed` runs
 # SELECT crawler.build_feed() (cross-source dedupe + the 24h job_feed table).
 #
-# RETENTION (see src/pgpipe/cleanup.py): open rows are NEVER deleted, so ids
-# and posted_at stay stable. A job is closed when its board was crawled OK and
-# the job was missing, or when it has not been seen for 36h (boards crawl every
-# 12h, so that is 3 missed runs; LinkedIn rows use 30h). Rows closed >7 days
-# are hard-deleted. Per company only the newest 400 open rows are kept (extras
-# are closed, not deleted).
+# RETENTION (see src/pgpipe/cleanup.py): job_posting keeps only the last
+# PGPIPE_KEEP_DAYS (2) days of rows (open or closed) so the free-tier DB stays
+# small; expired rows are remembered in crawler.seen_posting first, which stops
+# them being re-inserted as "new" and keeps undated jobs' first_seen_at. A job
+# is closed when its board was crawled OK and the job was missing, or when it
+# has not been seen for 36h (boards crawl every 12h; LinkedIn rows use 30h).
+# Per company only the newest 400 open rows are kept (extras are closed).
+# PGPIPE_MAX_ROWS is a safety cap; seen_posting is pruned after 45 days.
 #
 # SIZING: ~4,100 boards (≈2.9k greenhouse, ≈0.95k ashby, ≈0.3k workday, ≈0.25k
 # lever). Per-host politeness spaces request starts ~0.7s apart, so the shared
@@ -51,10 +53,14 @@ jobs:
       PGPIPE_PRIORITY_MONITORS: "greenhouse,workday"
       PGPIPE_PRIORITY_WEIGHT: "0.7"
       # Retention (consistent with the 12h cadence): close after 36h unseen
-      # (30h for LinkedIn), delete only rows CLOSED more than 7 days ago.
+      # (30h for LinkedIn); keep only the last 2 days of rows (seen_posting
+      # remembers the rest); safety cap 60k rows; forget seen jobs after 45d.
       PGPIPE_CLOSE_AFTER_HOURS: "36"
       PGPIPE_CLOSE_AFTER_HOURS_LINKEDIN: "30"
       PGPIPE_MAX_AGE_DAYS: "7"
+      PGPIPE_KEEP_DAYS: "2"
+      PGPIPE_MAX_ROWS: "60000"
+      PGPIPE_SEEN_TTL_DAYS: "45"
       PGPIPE_PER_COMPANY_CAP: "400"
 
     steps:

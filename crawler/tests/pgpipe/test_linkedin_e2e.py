@@ -6,6 +6,8 @@ Exercises the contract between linkedin_search.py and schema.sql together
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -27,8 +29,9 @@ def _cards():
     return cards
 
 
-def _persist(uri, cards):
-    return asyncio.run(li.persist(uri, SCHEMA, cards, li.Stats()))
+def _persist(uri, cards, keep_days=36500, stats=None):
+    # fixture cards carry fixed old dates; the retention window is exercised separately
+    return asyncio.run(li.persist(uri, SCHEMA, cards, stats or li.Stats(), keep_days=keep_days))
 
 
 def test_linkedin_persist_build_feed_and_repost_stability(db):
@@ -77,3 +80,41 @@ def test_linkedin_duplicate_of_ats_job_is_folded(db):
     assert "linkedin.com/jobs/view" in alt
     feed_sources = [r[0] for r in q(conn, f"SELECT source FROM {SCHEMA}.job_feed")]
     assert feed_sources == ["greenhouse"]
+
+
+def _card(job_id, posted_ago, repost_ago=None):
+    c = _cards()[0]
+    now = datetime.now(timezone.utc)
+    return replace(c, job_id=job_id, posted_at=now - posted_ago,
+                   reposted_at=(now - repost_ago) if repost_ago else None,
+                   is_repost=repost_ago is not None)
+
+
+def test_old_linkedin_card_skipped_but_repost_inside_window_kept(db):
+    uri, conn = db
+    _reset(conn)
+    q(conn, f"TRUNCATE {SCHEMA}.seen_posting")
+    old = _card("9000000001", timedelta(days=10))
+    repost = _card("9000000002", timedelta(days=10), repost_ago=timedelta(hours=2))
+    fresh = _card("9000000003", timedelta(hours=4))
+    for c in (old, repost, fresh):
+        c.url = li.JOB_URL.format(job_id=c.job_id)
+    # the repost was first seen 5 days ago (e.g. earlier crawl, row since expired)
+    q(conn, f"INSERT INTO {SCHEMA}.seen_posting (key, first_seen_at, posted_at, last_seen_at) "
+            f"VALUES ({SCHEMA}.posting_key('9000000002','linkedin',%s,NULL,%s), "
+            "now() - interval '5 days', now() - interval '10 days', now() - interval '1 day')",
+      (li.slugify(repost.company_name), repost.url))
+    stats = li.Stats()
+    _persist(uri, [old, repost, fresh], keep_days=2, stats=stats)
+    rows = {r[0]: r for r in q(conn, f"SELECT linkedin_job_id, first_seen_at, reposted_at, eff_at, repost_count "
+                                     f"FROM {SCHEMA}.job_posting ORDER BY 1")}
+    assert set(rows) == {"9000000002", "9000000003"}          # 10-day-old non-repost never inserted
+    assert stats.skipped_old == 1 and stats.new == 2
+    _, first_seen, reposted, eff, _ = rows["9000000002"]
+    assert datetime.now(timezone.utc) - first_seen > timedelta(days=4, hours=23)  # original, not "now"
+    assert reposted is not None and eff == reposted            # shows in the feed as reposted
+    # the skipped card is still remembered for the TTL
+    assert q(conn, f"SELECT count(*) FROM {SCHEMA}.seen_posting")[0][0] == 3
+    # re-run: nothing changes, the skipped card stays skipped
+    _persist(uri, [old, repost, fresh], keep_days=2)
+    assert q(conn, f"SELECT count(*) FROM {SCHEMA}.job_posting")[0][0] == 2

@@ -66,7 +66,7 @@ def q(conn, sql, args=None):
 
 
 def _reset(conn):
-    q(conn, f"TRUNCATE {SCHEMA}.job_feed, {SCHEMA}.job_posting RESTART IDENTITY CASCADE")
+    q(conn, f"TRUNCATE {SCHEMA}.job_feed, {SCHEMA}.job_posting, {SCHEMA}.seen_posting RESTART IDENTITY CASCADE")
 
 
 def _company(conn, slug, name=None):
@@ -251,13 +251,13 @@ class _Boards:
         self.jobs = jobs
 
 
-async def _crawl(pool, monkeypatch, jobs, run_id):
+async def _crawl(pool, monkeypatch, jobs, run_id, keep_days=36500):
     async def fake(_mt, _bd, _http):
         return list(jobs)
     monkeypatch.setattr(ingest, "_discover", fake)
     board = await pool.fetchrow("SELECT board_slug, company_slug, board_url, monitor_type, "
                                 "monitor_config FROM job_board WHERE board_slug='acme-gh'")
-    return await ingest.crawl_board(pool, board, None, run_id)
+    return await ingest.crawl_board(pool, board, None, run_id, keep_days=keep_days)
 
 
 def _job(n, date=None, **kw):
@@ -280,8 +280,8 @@ async def test_ids_and_posted_at_stable_across_crawls(pool, monkeypatch):
     # undated job keeps its original posted_at (not reset to now)
     assert after["greenhouse:acme:1"]["posted_at"] == old_posted
     assert after["greenhouse:acme:2"]["posted_at"] == datetime(2026, 10, 1, tzinfo=timezone.utc)
-    # open rows are never hard-deleted, however old
-    assert await cleanup.hard_delete_stale(pool, 1) == 0
+    # an open row is only ever expired by the keep window (here: effectively off)
+    assert await cleanup.hard_delete_stale(pool, 1, keep_days=36500) == 0
 
 
 async def test_missing_job_closed_only_on_good_crawl_and_reopens(pool, monkeypatch):
@@ -355,3 +355,86 @@ async def test_board_gone_is_logged(pool, monkeypatch):
     assert await pool.fetchval("SELECT is_enabled FROM job_board") is False
     row = await pool.fetchrow("SELECT board_slug, event, run_id FROM board_health WHERE board_slug='acme-gh'")
     assert (row["board_slug"], row["event"], row["run_id"]) == ("acme-gh", "gone", 5)
+
+
+# --- short retention window + seen_posting memory --------------------------------
+def _iso(**delta):
+    return (datetime.now(timezone.utc) - timedelta(**delta)).isoformat()
+
+
+async def _ids(pool):
+    return {r["external_id"]: r for r in await pool.fetch("SELECT * FROM job_posting")}
+
+
+async def test_posting_key_sql_matches_python(pool):
+    from src.pgpipe.keys import posting_key
+    cases = [("123", "linkedin", "acme", None, "u"), (None, "greenhouse", "acme", "gh:1", "u"),
+             (None, "greenhouse", "acme", None, "https://x/1"), (None, "lever", "acme", "", "https://x/2")]
+    for li, src, co, ext, url in cases:
+        got = await pool.fetchval("SELECT posting_key($1,$2,$3,$4,$5)", li, src, co, ext, url)
+        assert str(got) == str(posting_key(li, src, co, ext, url))
+
+
+async def test_expired_job_is_not_reinserted_and_keeps_first_seen(pool, monkeypatch):
+    # (a) undated job 1 and recent job 2 are crawled with the real 2-day window
+    await _crawl(pool, monkeypatch, [_job(1), _job(2, _iso(hours=3))], 1, keep_days=2)
+    assert len(await _ids(pool)) == 2
+    # job 1 turns 3 days old, job 2 stays fresh -> retention deletes only job 1
+    await pool.execute("UPDATE job_posting SET first_seen_at = now() - interval '3 days', "
+                       "posted_at = now() - interval '3 days' WHERE external_id LIKE '%:1'")
+    assert await cleanup.hard_delete_stale(pool, keep_days=2) == 1
+    assert set(await _ids(pool)) == {"greenhouse:acme:2"}
+    seen = await pool.fetchrow(
+        "SELECT * FROM seen_posting WHERE key = posting_key(NULL,'greenhouse','acme','greenhouse:acme:1',NULL)")
+    assert seen is not None and seen["first_seen_at"] < datetime.now(timezone.utc) - timedelta(days=2)
+    # next crawl still lists it: NOT re-inserted, seen_posting.last_seen refreshed
+    await pool.execute("UPDATE seen_posting SET last_seen_at = now() - interval '20 days'")
+    await _crawl(pool, monkeypatch, [_job(1), _job(2, _iso(hours=3))], 2, keep_days=2)
+    assert set(await _ids(pool)) == {"greenhouse:acme:2"}
+    assert await pool.fetchval(
+        "SELECT count(*) FROM seen_posting WHERE last_seen_at > now() - interval '1 hour'") == 2
+
+
+async def test_undated_job_reappearing_inside_window_keeps_original_first_seen(pool, monkeypatch):
+    await _crawl(pool, monkeypatch, [_job(7)], 1, keep_days=2)
+    orig = datetime.now(timezone.utc) - timedelta(hours=30)
+    await pool.execute("UPDATE job_posting SET first_seen_at = $1, posted_at = $1", orig)
+    # the board dropped it a while ago -> closed row is deleted by the closed window
+    await pool.execute("UPDATE job_posting SET status='closed', closed_at = now() - interval '8 days'")
+    assert await cleanup.hard_delete_stale(pool, 7, keep_days=2) == 1
+    assert await pool.fetchval("SELECT count(*) FROM job_posting") == 0
+    # it comes back: re-inserted, but first_seen_at / posted_at are the ORIGINAL ones
+    await _crawl(pool, monkeypatch, [_job(7)], 2, keep_days=2)
+    row = (await _ids(pool))["greenhouse:acme:7"]
+    assert row["first_seen_at"] == orig and row["posted_at"] == orig and row["status"] == "open"
+
+
+async def test_job_posted_10_days_ago_is_never_inserted(pool, monkeypatch):
+    await _crawl(pool, monkeypatch, [_job(1, _iso(days=10)), _job(2, _iso(hours=5))], 1, keep_days=2)
+    assert set(await _ids(pool)) == {"greenhouse:acme:2"}
+    # remembered, so it can never show up later as "new"
+    assert await pool.fetchval("SELECT count(*) FROM seen_posting") == 2
+    await _crawl(pool, monkeypatch, [_job(1, _iso(days=10)), _job(2, _iso(hours=5))], 2, keep_days=2)
+    assert set(await _ids(pool)) == {"greenhouse:acme:2"}
+
+
+async def test_row_cap_deletes_oldest_and_remembers_them(pool, monkeypatch):
+    await _crawl(pool, monkeypatch, [_job(i) for i in range(1, 6)], 1, keep_days=2)
+    for i in range(1, 6):   # job i is i hours old -> job 5 oldest
+        await pool.execute("UPDATE job_posting SET posted_at = now() - make_interval(hours => $1) "
+                           "WHERE external_id = $2", i, f"greenhouse:acme:{i}")
+    assert await cleanup.enforce_row_cap(pool, 10) == 0
+    assert await cleanup.enforce_row_cap(pool, 3) == 2
+    assert set(await _ids(pool)) == {f"greenhouse:acme:{i}" for i in (1, 2, 3)}
+    assert await pool.fetchval("SELECT count(*) FROM seen_posting") == 5
+    assert await cleanup.enforce_row_cap(pool, 0) == 0   # 0 disables
+
+
+async def test_seen_posting_ttl(pool):
+    await pool.execute(
+        "INSERT INTO seen_posting (key, first_seen_at, posted_at, last_seen_at) VALUES "
+        "(posting_key('1','linkedin','a',NULL,'u'), now() - interval '60 days', NULL, now() - interval '46 days'),"
+        "(posting_key('2','linkedin','a',NULL,'u'), now() - interval '60 days', NULL, now() - interval '44 days'),"
+        "(posting_key('3','linkedin','a',NULL,'u'), now(), NULL, now())")
+    assert await cleanup.prune_seen(pool, 45) == 1
+    assert await pool.fetchval("SELECT count(*) FROM seen_posting") == 2

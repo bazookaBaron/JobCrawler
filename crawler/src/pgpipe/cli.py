@@ -6,13 +6,16 @@
     jobs run [--minutes N]       one bounded crawl pass (default 20): reclaim ->
                                  enqueue -> crawl (tech-filter + seniority-tag,
                                  closes jobs missing from a good crawl) ->
-                                 close-stale -> prune (closes) -> hard-delete closed
+                                 close-stale -> prune (closes) -> expire old rows ->
+                                 row cap -> prune seen_posting
     jobs close-stale [--hours N] status='closed' for postings unseen N hours (def 36;
                                  30 for source=linkedin)
     jobs prune [--cap N]         keep newest N open postings per company (def 400);
                                  the rest are CLOSED, never deleted
-    jobs hard-delete [--days N]  DELETE postings CLOSED more than N days ago (def 7);
-                                 open rows are never deleted
+    jobs hard-delete [--days N]  DELETE postings older than PGPIPE_KEEP_DAYS (def 2) or
+                                 CLOSED more than N days ago (def 7); each is
+                                 remembered in seen_posting first
+    jobs retain                  hard-delete + PGPIPE_MAX_ROWS cap + seen_posting TTL
     jobs build-feed              SELECT <schema>.build_feed(): dedupe + rebuild job_feed
     jobs snapshot-market         compute crawler.compute_market_snapshot() and
                                   upsert it into public.jobs_market_snapshot_daily
@@ -131,7 +134,24 @@ async def _cmd_hard_delete(days: int | None) -> int:
         n = await cleanup.hard_delete_stale(pool, days)
     finally:
         await pool.close()
-    _p({"hard_deleted_closed": n, "closed_for_days": days or settings.max_age_days})
+    _p({"hard_deleted": n, "keep_days": settings.keep_days,
+        "closed_for_days": days or settings.max_age_days})
+    return 0
+
+
+async def _cmd_retain() -> int:
+    """Whole retention pass: expire rows outside the keep window (seen_posting
+    remembers them first), enforce the row cap, prune old seen_posting rows."""
+    pool = await connect()
+    try:
+        expired = await cleanup.hard_delete_stale(pool)
+        capped = await cleanup.enforce_row_cap(pool)
+        seen_pruned = await cleanup.prune_seen(pool)
+    finally:
+        await pool.close()
+    _p({"expired": expired, "capped": capped, "seen_pruned": seen_pruned,
+        "keep_days": settings.keep_days, "max_rows": settings.max_rows,
+        "seen_ttl_days": settings.seen_ttl_days})
     return 0
 
 
@@ -251,6 +271,7 @@ def main() -> None:
     pp.add_argument("--cap", type=int, default=None)
     hp = sub.add_parser("hard-delete")
     hp.add_argument("--days", type=int, default=None)
+    sub.add_parser("retain")
     sub.add_parser("build-feed")
     sub.add_parser("snapshot-market")
     sub.add_parser("backfill-posted-at")
@@ -271,6 +292,8 @@ def main() -> None:
         rc = asyncio.run(_cmd_prune(args.cap))
     elif args.cmd == "hard-delete":
         rc = asyncio.run(_cmd_hard_delete(args.days))
+    elif args.cmd == "retain":
+        rc = asyncio.run(_cmd_retain())
     elif args.cmd == "build-feed":
         rc = asyncio.run(_cmd_build_feed())
     elif args.cmd == "snapshot-market":

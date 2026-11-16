@@ -840,6 +840,46 @@ BEGIN
 END
 $fn$;
 
+-- --- seen_posting: compact "have we ever seen this job" memory ----------------
+-- job_posting only keeps the last PGPIPE_KEEP_DAYS (2) days of rows. seen_posting
+-- (~100 bytes/row incl. the pkey) remembers first_seen_at / posted_at for far
+-- longer (PGPIPE_SEEN_TTL_DAYS, 45) so a job we already expired is not
+-- re-inserted as "new", and an undated job keeps its original first_seen_at.
+-- key = posting_key(...) below (md5 -> uuid). Mirror: src/pgpipe/keys.py::posting_key.
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.seen_posting (
+    key           uuid PRIMARY KEY,
+    first_seen_at timestamptz NOT NULL,
+    posted_at     timestamptz,                 -- real/estimated posting date, NULL = undated
+    last_seen_at  timestamptz NOT NULL
+);
+
+CREATE OR REPLACE FUNCTION {{SCHEMA}}.posting_key(
+    p_linkedin_job_id text, p_source text, p_company_slug text,
+    p_external_id text, p_url text) RETURNS uuid
+LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT md5(CASE
+        WHEN coalesce(p_linkedin_job_id, '') <> '' THEN 'li:' || p_linkedin_job_id
+        WHEN coalesce(p_external_id, '') <> ''
+            THEN 'x:' || coalesce(p_source, '') || '|' || coalesce(p_company_slug, '') || '|' || p_external_id
+        ELSE 'u:' || coalesce(p_company_slug, '') || '|' || coalesce(p_url, '')
+    END)::uuid
+$fn$;
+
+-- one-time backfill from the rows that exist when this migration first runs
+DO $seen_bf$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM {{SCHEMA}}.seen_posting LIMIT 1) THEN
+        INSERT INTO {{SCHEMA}}.seen_posting (key, first_seen_at, posted_at, last_seen_at)
+        SELECT DISTINCT ON (k) k, first_seen_at, posted_at, last_seen_at
+          FROM (SELECT {{SCHEMA}}.posting_key(linkedin_job_id, source, company_slug, external_id, url) AS k,
+                       first_seen_at, posted_at, last_seen_at
+                  FROM {{SCHEMA}}.job_posting) b
+         ORDER BY k, first_seen_at
+        ON CONFLICT (key) DO NOTHING;
+    END IF;
+END
+$seen_bf$;
+
 -- --- roles + grants for the new objects ---------------------------------------
 -- crawler_writer: least-privilege role for the scheduled workflows / Oracle VM.
 -- NOLOGIN here; create a login user that inherits it (see README):
