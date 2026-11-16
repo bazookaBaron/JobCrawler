@@ -1,0 +1,32 @@
+name: migrate-schema
+
+# Manual only. Applies crawler/src/pgpipe/schema.sql (idempotent). Needs the
+# ADMIN/owner connection string (secret LOCAL_DATABASE_URL), NOT the
+# least-privilege crawler_writer one. Run it after merging any schema change
+# and before the next crawl-jobs run. Equivalent to `jobs migrate` locally.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: crawler
+    env:
+      LOCAL_DATABASE_URL: ${{ secrets.LOCAL_DATABASE_URL }}
+      PGPIPE_SCHEMA: crawler
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: Apply schema
+        run: uv run --no-sync jobs migrate

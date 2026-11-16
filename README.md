@@ -38,12 +38,15 @@ job-crawler/
 │   ├── data/boards.csv        ~516 rich-monitor boards (trimmed)
 │   └── pyproject.toml         + `jobs = "src.pgpipe.cli:main"`
 ├── .github/workflows/
-│   ├── crawl-jobs.yml         cron every 6h: migrate -> sync -> run (+close+prune)
-│   ├── cleanup-stale-jobs.yml cron daily: hard-delete postings unseen 5d
+│   ├── crawl-jobs.yml         cron every 12h: sync -> run (+close/prune) -> build-feed
+│   ├── cleanup-stale-jobs.yml cron daily: snapshot, close-stale, prune, delete closed >7d, build-feed
+│   ├── migrate-schema.yml     manual: apply schema.sql with the ADMIN secret
+│   ├── keepalive.yml          monthly: re-enable scheduled workflows (60-day inactivity rule)
 │   └── market-report.yml      cron daily: market report -> report_daily / report_weekly
 ├── search/jobs_search.sql     FTS functions on crawler.job_posting
 ├── search/jobs_search.js      node-postgres / supabase-js wrappers
 ├── tools/trim_csvs.py         regenerates the trimmed CSVs from upstream
+├── tools/import_aja_boards.py merges AutoJobApplier cloud_hunter/companies.json into the CSVs
 ├── tools/build_report_data.py regenerates crawler/data/report/ + taxonomies
 ├── patches/                   the two diffs vs upstream (config, pyproject)
 ├── RUN_LOCAL.md               exact first-run commands
@@ -59,14 +62,18 @@ uv run --no-sync jobs migrate                  schema + seniority col + jobs_ana
 uv run --no-sync jobs purge                    TRUNCATE job_posting + reset crawl_queue (clean re-scrape)
 uv run --no-sync jobs sync                     data/*.csv -> crawler.company / job_board
 uv run --no-sync jobs run [--minutes 20]       one bounded crawl pass
-uv run --no-sync jobs close-stale [--days 3]   status='closed' for postings unseen N days
-uv run --no-sync jobs prune [--cap 400]        keep newest N postings per company
-uv run --no-sync jobs hard-delete [--days 5]   DELETE postings unseen N days
+uv run --no-sync jobs close-stale [--hours 36] status='closed' for postings unseen N hours (30h for linkedin)
+uv run --no-sync jobs prune [--cap 400]        keep newest N OPEN postings per company (extras are closed)
+uv run --no-sync jobs hard-delete [--days 7]   DELETE rows CLOSED more than N days ago (never open rows)
+uv run --no-sync jobs build-feed               SELECT crawler.build_feed(): LinkedIn/ATS dedupe + rebuild crawler.job_feed
 uv run --no-sync jobs stats                    row counts
 ```
 
 `jobs run` = reclaim stale claims → enqueue every enabled board → N workers
-claim + fetch + **tech-filter + seniority-tag** + upsert → close-stale → prune.
+claim + fetch + **tech-filter + seniority-tag** + upsert (closing jobs that vanished
+from a successfully crawled board) → close-stale (36h) → prune (closes) →
+hard-delete rows closed > 7 days. Open rows are never deleted, so ids and
+`posted_at` are stable. Run `jobs build-feed` afterwards (the workflows do).
 Clean re-scrape: `jobs migrate && jobs purge && jobs sync && jobs run`. See `RUN_LOCAL.md`.
 
 ---
@@ -176,12 +183,44 @@ This repo has **no git remote** yet. To run it on GitHub Actions:
    git push -u origin main
    ```
 2. Repo → **Settings → Secrets and variables → Actions → New repository secret**:
-   `LOCAL_DATABASE_URL` = your Supabase URI (session pooler, port 5432,
-   `?sslmode=require`). That is the only secret. **No `REDIS_URL`.**
-3. Actions tab → run **crawl-jobs** once via *Run workflow*, then
-   **cleanup-stale-jobs** once. After that both run on cron
-   (crawl every 6 h, cleanup daily 04:17 UTC).
+   * `LOCAL_DATABASE_URL` = ADMIN/owner Supabase URI (session pooler, port 5432,
+     `?sslmode=require`). Used only by the manual **migrate-schema** workflow
+     (and `jobs migrate` locally).
+   * `CRAWLER_DATABASE_URL` = URI of the least-privilege `crawler_writer` login
+     (below). The crawl/cleanup workflows read this and fall back to
+     `LOCAL_DATABASE_URL` if it is unset. **No `REDIS_URL`.**
+3. Actions tab → run **migrate-schema** once, then **crawl-jobs**, then
+   **cleanup-stale-jobs**. After that crawl runs every 12 h (`0 */12 * * *`) and
+   cleanup daily 23:27 UTC. **keepalive** re-enables the schedules monthly so
+   GitHub's 60-day inactivity rule never switches them off.
 4. Apply search helpers once: `psql "$LOCAL_DATABASE_URL" -f search/jobs_search.sql`.
+
+### Database roles (least privilege)
+
+`jobs migrate` creates a `NOLOGIN` role `crawler_writer` with USAGE on schema
+`crawler`, SELECT/INSERT/UPDATE/DELETE on its tables, EXECUTE on
+`crawler.build_feed()`, and INSERT/UPDATE on `public.jobs_market_snapshot_daily`
+(for `snapshot-market`) - nothing else in `public`/`auth`. Create a login that
+inherits it, once, in the Supabase SQL editor:
+
+```sql
+CREATE ROLE crawler_ci LOGIN PASSWORD '<strong password>' IN ROLE crawler_writer;
+```
+
+Use `postgresql://crawler_ci.<project-ref>:<password>@<pooler-host>:5432/postgres?sslmode=require`
+(pooler logins are `user.<project-ref>`) as the `CRAWLER_DATABASE_URL` secret.
+The crawler never needs the `postgres` password except to run migrations.
+
+### Retention model
+
+Open rows are never hard-deleted, so row ids and `posted_at` are stable. A job is
+closed when (a) its board was crawled successfully and the job was missing, or
+(b) it has not been seen for 36 h (30 h for `source='linkedin'`). Rows closed for
+more than 7 days are deleted. Per company only the newest 400 open rows are kept
+(the rest are closed). A board that returns `BoardGoneError` is disabled and
+logged in `crawler.board_health`; boards failing 5+ runs in a row are logged
+there too, and both are listed at the end of every `jobs run` (and in the job
+summary).
 
 See `UPSTREAM_DRIFT.md` for exactly what changed vs jobseek and how to pull a
 newer upstream.

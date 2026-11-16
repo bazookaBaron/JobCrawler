@@ -46,7 +46,11 @@ def _csv_lower(name: str, default: str) -> tuple[str, ...]:
 @dataclass(frozen=True)
 class Settings:
     # Supabase Postgres — the ONLY external dependency. No REDIS_URL anymore.
+    # LOCAL_DATABASE_URL = admin/owner URI (needed by `jobs migrate`).
+    # CRAWLER_DATABASE_URL = least-privilege `crawler_writer` login used by the
+    # scheduled workflows; preferred for everything except `migrate`.
     database_url: str = os.environ.get("LOCAL_DATABASE_URL", "").strip()
+    writer_database_url: str = os.environ.get("CRAWLER_DATABASE_URL", "").strip()
 
     # Dedicated Postgres schema so nothing collides with the shared webapp DB.
     schema: str = (os.environ.get("PGPIPE_SCHEMA", "crawler").strip() or "crawler")
@@ -80,15 +84,19 @@ class Settings:
     )
     priority_weight: float = _float("PGPIPE_PRIORITY_WEIGHT", 0.7)
 
-    # Retention. The board only carries jobs first seen in the last
-    # `max_age_days` days — anything older is hard-deleted from Postgres on
-    # every crawl pass (and again by the daily cleanup workflow). `close_after
-    # _days` still hides postings that vanish from their board inside that
-    # window (webapp shows status='open' only).
+    # Retention. Open rows are NEVER hard-deleted (ids and posted_at must stay
+    # stable). A posting is closed when (a) its board was crawled successfully
+    # this run and it was missing, or (b) it has not been seen for
+    # `close_after_hours` (boards crawl every 12h -> 36h) /
+    # `close_after_hours_linkedin` (LinkedIn every 2h -> 30h). Only rows closed
+    # more than `max_age_days` (7) days ago are hard-deleted.
     per_company_cap: int = _int("PGPIPE_PER_COMPANY_CAP", 400)
-    close_after_days: int = _int("PGPIPE_CLOSE_AFTER_DAYS", 1)
-    delete_after_days: int = _int("PGPIPE_DELETE_AFTER_DAYS", 1)
-    max_age_days: int = _int("PGPIPE_MAX_AGE_DAYS", 1)
+    close_after_hours: int = (
+        _int("PGPIPE_CLOSE_AFTER_DAYS", 0) * 24 or _int("PGPIPE_CLOSE_AFTER_HOURS", 36)
+    )
+    close_after_hours_linkedin: int = _int("PGPIPE_CLOSE_AFTER_HOURS_LINKEDIN", 30)
+    max_age_days: int = _int("PGPIPE_MAX_AGE_DAYS", 7)  # days a CLOSED row is kept
+    delete_after_days: int = _int("PGPIPE_DELETE_AFTER_DAYS", 7)
 
     worker_id: str = os.environ.get("PGPIPE_WORKER_ID", "").strip() or f"gha-{os.getpid()}"
 
@@ -99,13 +107,21 @@ class Settings:
             )
         return self.schema
 
-    def require_db(self) -> str:
-        if not self.database_url:
-            raise SystemExit(
-                "LOCAL_DATABASE_URL is not set. Put the Supabase URI in "
-                "crawler/.env.local (see .env.local.example) or the CI secret."
-            )
-        return self.database_url
+    def require_db(self, admin: bool = False) -> str:
+        """DSN to use. `admin=True` (jobs migrate) prefers LOCAL_DATABASE_URL;
+        otherwise the least-privilege CRAWLER_DATABASE_URL wins when set."""
+        order = (
+            (self.database_url, self.writer_database_url)
+            if admin
+            else (self.writer_database_url, self.database_url)
+        )
+        for dsn in order:
+            if dsn:
+                return dsn
+        raise SystemExit(
+            "CRAWLER_DATABASE_URL / LOCAL_DATABASE_URL is not set. Put the Supabase "
+            "URI in crawler/.env.local (see .env.local.example) or the CI secret."
+        )
 
 
 settings = Settings()

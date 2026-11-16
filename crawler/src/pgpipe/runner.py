@@ -1,8 +1,11 @@
 """`jobs run` — one bounded crawl pass, single process, Postgres-only.
 
 reclaim stale claims -> enqueue every enabled board -> N worker coroutines
-claim (FOR UPDATE SKIP LOCKED) + crawl + upsert -> close stale -> prune caps
--> write a crawl_run summary row.
+claim (FOR UPDATE SKIP LOCKED) + crawl + upsert (+ close jobs missing from a
+successfully crawled board) -> close stale (36h / 30h linkedin) -> cap per
+company (closes, never deletes) -> hard-delete rows closed > 7d -> record
+board health + log disabled/failing boards -> write a crawl_run summary row.
+Open rows are never deleted, so ids stay stable.
 """
 from __future__ import annotations
 
@@ -10,12 +13,15 @@ import asyncio
 import time
 
 import asyncpg
+import structlog
 
 from src.pgpipe import cleanup, queue
 from src.pgpipe.config import settings
 from src.pgpipe.http import make_client
 from src.pgpipe.ingest import crawl_board, record_board_failure
 from src.pgpipe.throttle import Politeness
+
+log = structlog.get_logger()
 
 
 async def _worker(
@@ -25,6 +31,7 @@ async def _worker(
     pol: Politeness,
     deadline: float,
     stats: dict,
+    run_id: int | None = None,
 ) -> None:
     while time.monotonic() < deadline:
         row = await queue.claim_one(pool)
@@ -34,18 +41,59 @@ async def _worker(
         try:
             async with pol.slot(row["board_url"]):
                 res = await asyncio.wait_for(
-                    crawl_board(pool, row, http), timeout=settings.board_timeout_seconds
+                    crawl_board(pool, row, http, run_id), timeout=settings.board_timeout_seconds
                 )
             await queue.finish_ok(pool, qid)
             stats["ok"] += 1
             stats["upserted"] += res["upserted"]
             stats["dropped_nontech"] += res["dropped_nontech"]
+            stats["closed_missing"] += res.get("closed_missing", 0)
+            if res.get("gone"):
+                stats["gone"].append(slug)
         except Exception as exc:  # noqa: BLE001 - queue records + retries
             msg = f"{type(exc).__name__}: {exc}"
             await record_board_failure(pool, slug, msg)
             await queue.finish_err(pool, qid, attempts, msg)
             stats["failed"] += 1
             stats["errors"].append(f"{slug}: {msg}")
+
+
+_FAILING_THRESHOLD = 5
+
+
+async def _record_board_health(pool: asyncpg.Pool, run_id: int, gone: list[str]) -> dict:
+    """Log boards disabled as gone this run + boards failing persistently, both
+    to stdout/structlog (end-of-run summary) and to <schema>.board_health."""
+    rows = await pool.fetch(
+        """
+        SELECT board_slug, consecutive_failures, last_error FROM job_board
+        WHERE is_enabled AND consecutive_failures >= $1
+        ORDER BY consecutive_failures DESC, board_slug
+        """,
+        _FAILING_THRESHOLD,
+    )
+    failing = [r["board_slug"] for r in rows]
+    for r in rows:
+        await pool.execute(
+            """
+            INSERT INTO board_health (board_slug, run_id, event, detail)
+            SELECT $1, $2, 'failing', $3
+            WHERE NOT EXISTS (
+                SELECT 1 FROM board_health h
+                WHERE h.board_slug = $1 AND h.event = 'failing'
+                  AND h.created_at > now() - interval '24 hours')
+            """,
+            r["board_slug"], run_id,
+            f"{r['consecutive_failures']} consecutive failures: {(r['last_error'] or '')[:500]}",
+        )
+    if gone:
+        log.warning("board_health.disabled_gone", count=len(gone), boards=gone)
+        print(f"WARNING: {len(gone)} board(s) disabled as GONE this run: {', '.join(gone)}")
+    if failing:
+        log.warning("board_health.failing", count=len(failing), boards=failing[:50])
+        print(f"WARNING: {len(failing)} board(s) failing >= {_FAILING_THRESHOLD} runs in a row: "
+              f"{', '.join(failing[:50])}")
+    return {"gone": gone, "failing": failing}
 
 
 async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
@@ -60,13 +108,16 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
     enqueued = await queue.enqueue_due(pool)
     pending = await pool.fetchval("SELECT count(*) FROM crawl_queue WHERE status='pending'")
 
-    stats = {"ok": 0, "failed": 0, "upserted": 0, "dropped_nontech": 0, "errors": []}
+    stats = {
+        "ok": 0, "failed": 0, "upserted": 0, "dropped_nontech": 0,
+        "closed_missing": 0, "gone": [], "errors": [],
+    }
     pol = Politeness()
     http = make_client()
     try:
         await asyncio.gather(
             *[
-                _worker(f"w{i}", pool, http, pol, deadline, stats)
+                _worker(f"w{i}", pool, http, pol, deadline, stats, run_id)
                 for i in range(settings.concurrency)
             ]
         )
@@ -74,16 +125,18 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
         await http.aclose()
 
     remaining = await pool.fetchval("SELECT count(*) FROM crawl_queue WHERE status='pending'")
-    closed = await cleanup.close_stale(pool)
-    deleted_old = await cleanup.hard_delete_stale(pool)  # enforce the 2-day age cap every pass
+    closed = stats["closed_missing"] + await cleanup.close_stale(pool)
     pruned = await cleanup.prune_per_company(pool)
+    deleted_old = await cleanup.hard_delete_stale(pool)  # only rows closed > 7d
+    health = await _record_board_health(pool, run_id, stats["gone"])
 
     kept = stats["upserted"]
     dropped = stats["dropped_nontech"]
     seen = kept + dropped
     notes = (
         f"reclaimed={reclaimed} enqueued={enqueued} remaining_pending={remaining} "
-        f"deleted_old={deleted_old} "
+        f"deleted_old={deleted_old} closed_missing={stats['closed_missing']} "
+        f"boards_gone={len(stats['gone'])} boards_failing={len(health['failing'])} "
         f"tech_filter: kept={kept} dropped_nontech={dropped} "
         f"({round(100.0 * kept / seen, 1) if seen else 0.0}% kept of {seen} seen)"
     )
@@ -118,6 +171,8 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
         "postings_dropped_nontech": dropped,
         "postings_closed": closed,
         "postings_deleted_old": deleted_old,
+        "boards_disabled_gone": stats["gone"],
+        "boards_failing": health["failing"],
         "postings_pruned": pruned,
         "errors": stats["errors"],
     }

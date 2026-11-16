@@ -4,11 +4,16 @@
     jobs purge                   TRUNCATE job_posting + reset crawl_queue (clean re-scrape)
     jobs sync                    data/*.csv -> <schema>.company / job_board
     jobs run [--minutes N]       one bounded crawl pass (default 20): reclaim ->
-                                 enqueue -> crawl (tech-filter + seniority-tag) ->
-                                 close-stale -> hard-delete (1-day age cap) -> prune
-    jobs close-stale [--days N]  status='closed' for postings unseen N days (def 1)
-    jobs prune [--cap N]         keep newest N postings per company (def 400)
-    jobs hard-delete [--days N]  DELETE postings older than N days by first_seen (def 1)
+                                 enqueue -> crawl (tech-filter + seniority-tag,
+                                 closes jobs missing from a good crawl) ->
+                                 close-stale -> prune (closes) -> hard-delete closed
+    jobs close-stale [--hours N] status='closed' for postings unseen N hours (def 36;
+                                 30 for source=linkedin)
+    jobs prune [--cap N]         keep newest N open postings per company (def 400);
+                                 the rest are CLOSED, never deleted
+    jobs hard-delete [--days N]  DELETE postings CLOSED more than N days ago (def 7);
+                                 open rows are never deleted
+    jobs build-feed              SELECT <schema>.build_feed(): dedupe + rebuild job_feed
     jobs snapshot-market         compute crawler.compute_market_snapshot() and
                                   upsert it into public.jobs_market_snapshot_daily
                                   for CURRENT_DATE (run BEFORE hard-delete)
@@ -41,7 +46,7 @@ def _p(obj: object) -> None:
 
 
 async def _cmd_migrate() -> int:
-    pool = await connect()
+    pool = await connect(admin=True)
     try:
         await apply_schema(pool)
         _p({"migrate": "ok", "schema": settings.validated_schema()})
@@ -69,8 +74,7 @@ async def _cmd_purge() -> int:
 async def _cmd_sync() -> int:
     pool = await connect()
     try:
-        await apply_schema(pool)  # safe: idempotent, keeps `sync` usable standalone
-        res = await csv_sync.sync(pool)
+        res = await csv_sync.sync(pool)  # schema is applied by `jobs migrate` (admin)
         _p({"sync": res})
     finally:
         await pool.close()
@@ -91,13 +95,23 @@ async def _cmd_run(minutes: float) -> int:
     return 0
 
 
-async def _cmd_close_stale(days: int | None) -> int:
+async def _cmd_close_stale(hours: int | None) -> int:
     pool = await connect()
     try:
-        n = await cleanup.close_stale(pool, days)
+        n = await cleanup.close_stale(pool, hours)
     finally:
         await pool.close()
-    _p({"closed": n, "days": days or settings.close_after_days})
+    _p({"closed": n, "hours": hours or settings.close_after_hours})
+    return 0
+
+
+async def _cmd_build_feed() -> int:
+    pool = await connect()
+    try:
+        n = await pool.fetchval("SELECT build_feed()")
+    finally:
+        await pool.close()
+    _p({"build_feed": "ok", "rows": int(n or 0)})
     return 0
 
 
@@ -117,16 +131,13 @@ async def _cmd_hard_delete(days: int | None) -> int:
         n = await cleanup.hard_delete_stale(pool, days)
     finally:
         await pool.close()
-    _p({"hard_deleted": n, "days": days or settings.max_age_days})
+    _p({"hard_deleted_closed": n, "closed_for_days": days or settings.max_age_days})
     return 0
 
 
 async def _cmd_snapshot_market() -> int:
     """Run crawler.compute_market_snapshot() and upsert the result into
-    public.jobs_market_snapshot_daily for CURRENT_DATE. Meant to run BEFORE
-    hard-delete in the daily cleanup workflow: at 1-day retention this table
-    is the only surviving record of a day's activity once the source rows
-    churn out."""
+    public.jobs_market_snapshot_daily for CURRENT_DATE."""
     pool = await connect()
     try:
         raw = await pool.fetchval("SELECT compute_market_snapshot()")
@@ -235,11 +246,12 @@ def main() -> None:
     rp = sub.add_parser("run")
     rp.add_argument("--minutes", type=float, default=20.0)
     cp = sub.add_parser("close-stale")
-    cp.add_argument("--days", type=int, default=None)
+    cp.add_argument("--hours", type=int, default=None)
     pp = sub.add_parser("prune")
     pp.add_argument("--cap", type=int, default=None)
     hp = sub.add_parser("hard-delete")
     hp.add_argument("--days", type=int, default=None)
+    sub.add_parser("build-feed")
     sub.add_parser("snapshot-market")
     sub.add_parser("backfill-posted-at")
     sub.add_parser("stats")
@@ -254,11 +266,13 @@ def main() -> None:
     elif args.cmd == "run":
         rc = asyncio.run(_cmd_run(args.minutes))
     elif args.cmd == "close-stale":
-        rc = asyncio.run(_cmd_close_stale(args.days))
+        rc = asyncio.run(_cmd_close_stale(args.hours))
     elif args.cmd == "prune":
         rc = asyncio.run(_cmd_prune(args.cap))
     elif args.cmd == "hard-delete":
         rc = asyncio.run(_cmd_hard_delete(args.days))
+    elif args.cmd == "build-feed":
+        rc = asyncio.run(_cmd_build_feed())
     elif args.cmd == "snapshot-market":
         rc = asyncio.run(_cmd_snapshot_market())
     elif args.cmd == "backfill-posted-at":
