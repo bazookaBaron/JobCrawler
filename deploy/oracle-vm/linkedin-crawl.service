@@ -1,0 +1,35 @@
+[Unit]
+Description=LinkedIn guest-API job crawl (logged-out, polite) -> Postgres
+Documentation=file:///opt/job-crawler/deploy/oracle-vm/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jobcrawler
+Group=jobcrawler
+WorkingDirectory=/opt/job-crawler/crawler
+EnvironmentFile=/etc/job-crawler/env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# flock -n -E 0: if a previous run is somehow still going, exit quietly instead of overlapping.
+ExecStart=/usr/bin/flock -n -E 0 /run/job-crawler/linkedin.lock \
+    /opt/job-crawler/.venv/bin/python -m src.pgpipe.linkedin_search --window-hours 3
+RuntimeDirectory=job-crawler
+TimeoutStartSec=90min
+
+# Stay out of the way of an Actions runner / Playwright on the same VM.
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=50%
+MemoryMax=512M
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
