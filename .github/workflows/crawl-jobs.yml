@@ -2,18 +2,26 @@ name: crawl-jobs
 
 # $0 compute: one scheduled GitHub Actions job. Single process, NO Redis, no
 # server. `jobs run` reclaims stale queue rows, enqueues every enabled board,
-# crawls them with an in-process politeness gate, upserts compact rows into the
-# dedicated `crawler` Postgres schema, then hard-deletes any posting older than
-# 1 day (first_seen_at) and trims each company to its newest 400. The board
-# only ever carries jobs from the last 24 hours.
+# crawls them with an in-process politeness gate and upserts compact rows into
+# the dedicated `crawler` Postgres schema. Then `jobs build-feed` runs
+# SELECT crawler.build_feed() (cross-source dedupe + the 24h job_feed table).
 #
-# CRON TUNING: every 2 hours (repo is public -> unlimited free Actions
-# minutes, no cost constraint). Check the "crawl" step duration against
-# RUN_MINUTES / the job timeout. ~516 boards at concurrency 12 with ATS
-# politeness (~0.6s per shared host) is roughly 5-12 min.
+# RETENTION (see src/pgpipe/cleanup.py): open rows are NEVER deleted, so ids
+# and posted_at stay stable. A job is closed when its board was crawled OK and
+# the job was missing, or when it has not been seen for 36h (boards crawl every
+# 12h, so that is 3 missed runs; LinkedIn rows use 30h). Rows closed >7 days
+# are hard-deleted. Per company only the newest 400 open rows are kept (extras
+# are closed, not deleted).
+#
+# SIZING: ~4,100 boards (≈2.9k greenhouse, ≈0.95k ashby, ≈0.3k workday, ≈0.25k
+# lever). Per-host politeness spaces request starts ~0.7s apart, so the shared
+# greenhouse host alone needs ≈2.9k x 0.7s ≈ 35 min; workday tenants are
+# separate hosts and run in parallel. Expect ~40-60 min end to end. RUN_MINUTES
+# (crawl budget) is 100 and the job timeout 115 so a slow day still finishes;
+# boards that don't fit stay queued for the next run (36h close window = slack).
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: "0 */12 * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -26,26 +34,28 @@ permissions:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 115
     defaults:
       run:
         shell: bash
         working-directory: crawler
     env:
-      # Repo -> Settings -> Secrets and variables -> Actions -> New repository secret
-      LOCAL_DATABASE_URL: ${{ secrets.LOCAL_DATABASE_URL }}   # Supabase Postgres URI
+      # Least-privilege `crawler_writer` login (see README). Falls back to the
+      # old admin secret so existing setups keep working until it is created.
+      CRAWLER_DATABASE_URL: ${{ secrets.CRAWLER_DATABASE_URL || secrets.LOCAL_DATABASE_URL }}
       PGPIPE_SCHEMA: crawler
-      PGPIPE_CONCURRENCY: "12"
-      RUN_MINUTES: "20"
+      PGPIPE_CONCURRENCY: "16"
+      RUN_MINUTES: "100"
       # Crawl-budget split: ~70% of each pass goes to the big ATS providers
-      # (greenhouse + workday), ~30% to the long tail. Both groups keep
-      # draining; if one empties the other takes the whole remaining budget.
+      # (greenhouse + workday), ~30% to the long tail.
       PGPIPE_PRIORITY_MONITORS: "greenhouse,workday"
       PGPIPE_PRIORITY_WEIGHT: "0.7"
-      # Board retention: keep only jobs first seen in the last N days; older
-      # rows are hard-deleted at the end of every pass.
-      PGPIPE_MAX_AGE_DAYS: "1"
-      PGPIPE_CLOSE_AFTER_DAYS: "1"
+      # Retention (consistent with the 12h cadence): close after 36h unseen
+      # (30h for LinkedIn), delete only rows CLOSED more than 7 days ago.
+      PGPIPE_CLOSE_AFTER_HOURS: "36"
+      PGPIPE_CLOSE_AFTER_HOURS_LINKEDIN: "30"
+      PGPIPE_MAX_AGE_DAYS: "7"
+      PGPIPE_PER_COMPANY_CAP: "400"
 
     steps:
       - name: Checkout
@@ -60,16 +70,22 @@ jobs:
       - name: Install dependencies (locked)
         run: uv sync --frozen
 
-      - name: Apply schema (idempotent)
-        run: uv run --no-sync jobs migrate
-
+      # Schema changes need the admin role: run the `migrate-schema` workflow
+      # (or `jobs migrate` locally) whenever schema.sql changes. `sync` only
+      # writes company/job_board rows, which crawler_writer may do.
       - name: Sync curated companies + boards (CSV -> Postgres)
         run: uv run --no-sync jobs sync | tee ../sync.json
 
-      - name: Crawl (bounded) + close stale (1d) + prune per-company cap (400)
+      - name: Crawl (bounded) + close missing/stale + cap per company + delete old closed
         run: |
           set -euo pipefail
           uv run --no-sync jobs run --minutes "${RUN_MINUTES}" | tee ../run.json
+
+      - name: Build feed (dedupe + job_feed)
+        if: always()
+        run: |
+          set -uo pipefail
+          uv run --no-sync jobs build-feed | tee ../feed.json
 
       - name: Job summary
         if: always()
@@ -82,6 +98,17 @@ jobs:
             echo '```json'; cat ../sync.json 2>/dev/null || echo '{}'; echo '```'
             echo '### run'
             echo '```json'; cat ../run.json 2>/dev/null || echo '{}'; echo '```'
+            echo '### build-feed'
+            echo '```json'; cat ../feed.json 2>/dev/null || echo '{}'; echo '```'
+            echo '### board health (disabled-as-gone / failing boards)'
+            echo '```'
+            python3 - <<'PY' 2>/dev/null || echo "see run.json: boards_disabled_gone / boards_failing"
+          import json
+          r = json.load(open("../run.json"))
+          print("gone   :", r.get("boards_disabled_gone"))
+          print("failing:", r.get("boards_failing"))
+          PY
+            echo '```'
             echo '### db stats'
             echo '```json'
             uv run --no-sync jobs stats 2>&1 || echo '{"stats":"unavailable"}'
