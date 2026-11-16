@@ -22,7 +22,7 @@ cp ../.env.local.example crawler/.env.local
 ```bash
 cd crawler
 uv sync
-uv run --no-sync jobs --help          # migrate | sync | run | close-stale | prune | hard-delete | stats
+uv run --no-sync jobs --help          # migrate | sync | run | close-stale | prune | hard-delete | retain | build-feed | stats
 ```
 
 ---
@@ -156,9 +156,10 @@ FROM crawler.search_jobs('distributed systems rust', NULL, NULL, 'open', 10, 0);
 ## Manual cleanup (also automated in the two workflows)
 
 ```bash
-uv run --no-sync jobs close-stale --days 3     # status='closed' when unseen 3 d
-uv run --no-sync jobs prune --cap 400          # newest 400 per company
-uv run --no-sync jobs hard-delete --days 5     # DELETE when unseen 5 d
+uv run --no-sync jobs close-stale --hours 36    # status='closed' when unseen 36 h
+uv run --no-sync jobs prune --cap 400          # newest 400 OPEN per company (extras closed)
+uv run --no-sync jobs retain                   # expire rows > PGPIPE_KEEP_DAYS (default 2), row cap, seen_posting TTL
+uv run --no-sync jobs build-feed               # dedupe + rebuild crawler.job_feed
 ```
 
 ---

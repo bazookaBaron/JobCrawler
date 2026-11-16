@@ -6,11 +6,11 @@ import asyncpg
 from src.pgpipe.config import SCHEMA_SQL, settings
 
 
-async def connect() -> asyncpg.Pool:
+async def connect(admin: bool = False) -> asyncpg.Pool:
     """Open a small pool against LOCAL_DATABASE_URL with search_path set to
     <schema>,public so unqualified table names resolve to our schema."""
     schema = settings.validated_schema()
-    dsn = settings.require_db()
+    dsn = settings.require_db(admin=admin)
     return await asyncpg.create_pool(
         dsn,
         min_size=1,

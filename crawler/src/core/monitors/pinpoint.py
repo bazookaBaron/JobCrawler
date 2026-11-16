@@ -151,7 +151,10 @@ def _parse_job(posting: dict) -> DiscoveredJob | None:
         locations=_build_location(posting),
         employment_type=employment_type,
         job_location_type=job_location_type,
-        date_posted=posting.get("deadline_at"),
+        # NOTE: `deadline_at` is the application *deadline*, not a posting date;
+        # Pinpoint's public postings API exposes no creation date, so leave it
+        # unset (ingest falls back to first_seen_at).
+        date_posted=None,
         base_salary=_parse_salary(posting),
         metadata=metadata or None,
     )
