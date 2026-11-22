@@ -86,9 +86,16 @@ class Settings:
     # _days` still hides postings that vanish from their board inside that
     # window (webapp shows status='open' only).
     per_company_cap: int = _int("PGPIPE_PER_COMPANY_CAP", 400)
-    close_after_days: int = _int("PGPIPE_CLOSE_AFTER_DAYS", 1)
+    close_after_days: int = _int("PGPIPE_CLOSE_AFTER_DAYS", 2)
     delete_after_days: int = _int("PGPIPE_DELETE_AFTER_DAYS", 1)
-    max_age_days: int = _int("PGPIPE_MAX_AGE_DAYS", 1)
+    # Fresh-pool retention: a row is deleted once it has not been seen by a
+    # crawl for `retain_days` days (closed/removed jobs vanish), or once its
+    # real POSTING date is older than `max_posting_age_days` (also the ingest
+    # filter; undated postings are kept). Env: RETAIN_DAYS / MAX_POSTING_AGE_DAYS.
+    retain_days: int = int(os.environ.get("RETAIN_DAYS") or os.environ.get("PGPIPE_RETAIN_DAYS") or 3)
+    max_posting_age_days: int = int(
+        os.environ.get("MAX_POSTING_AGE_DAYS") or os.environ.get("PGPIPE_MAX_POSTING_AGE_DAYS") or 30
+    )
 
     worker_id: str = os.environ.get("PGPIPE_WORKER_ID", "").strip() or f"gha-{os.getpid()}"
 

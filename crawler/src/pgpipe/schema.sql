@@ -417,3 +417,35 @@ GRANT SELECT ON ALL TABLES IN SCHEMA {{SCHEMA}} TO service_role;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {{SCHEMA}} TO service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA {{SCHEMA}} GRANT SELECT ON TABLES TO service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA {{SCHEMA}} GRANT EXECUTE ON FUNCTIONS TO service_role;
+
+-- --- daily breakdown (additive): one row set per snapshot_date at grain
+-- (country x role_bucket x seniority x company_type) with open + new-today
+-- counts. Idempotent per date: `jobs snapshot-market` deletes the date's rows
+-- and re-inserts them in one transaction. role_bucket is a title-keyword
+-- bucket (the crawler has no other role-family classifier).
+CREATE TABLE IF NOT EXISTS public.jobs_market_snapshot_breakdown_daily (
+    snapshot_date  date   NOT NULL,
+    country        text   NOT NULL,
+    role_bucket    text   NOT NULL,
+    seniority      text   NOT NULL,
+    company_type   text   NOT NULL,
+    open_count     bigint NOT NULL,
+    new_today      bigint NOT NULL,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (snapshot_date, country, role_bucket, seniority, company_type)
+);
+ALTER TABLE public.jobs_market_snapshot_breakdown_daily ENABLE ROW LEVEL SECURITY;
+DO $bd_policy$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public' AND tablename = 'jobs_market_snapshot_breakdown_daily'
+          AND policyname = 'jobs_market_snapshot_breakdown_daily_public_read'
+    ) THEN
+        CREATE POLICY jobs_market_snapshot_breakdown_daily_public_read
+            ON public.jobs_market_snapshot_breakdown_daily FOR SELECT
+            USING (true);
+    END IF;
+END
+$bd_policy$;
+GRANT SELECT ON public.jobs_market_snapshot_breakdown_daily TO anon, authenticated, service_role;

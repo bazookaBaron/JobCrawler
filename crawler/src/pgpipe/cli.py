@@ -5,7 +5,7 @@
     jobs sync                    data/*.csv -> <schema>.company / job_board
     jobs run [--minutes N]       one bounded crawl pass (default 20): reclaim ->
                                  enqueue -> crawl (tech-filter + seniority-tag) ->
-                                 close-stale -> hard-delete (1-day age cap) -> prune
+                                 close-stale -> hard-delete (RETAIN_DAYS / MAX_POSTING_AGE_DAYS) -> prune
     jobs close-stale [--days N]  status='closed' for postings unseen N days (def 1)
     jobs prune [--cap N]         keep newest N postings per company (def 400)
     jobs hard-delete [--days N]  DELETE postings older than N days by first_seen (def 1)
@@ -117,8 +117,37 @@ async def _cmd_hard_delete(days: int | None) -> int:
         n = await cleanup.hard_delete_stale(pool, days)
     finally:
         await pool.close()
-    _p({"hard_deleted": n, "days": days or settings.max_age_days})
+    _p({"hard_deleted": n, "days": days or settings.retain_days})
     return 0
+
+
+_BREAKDOWN_SQL = r"""
+INSERT INTO public.jobs_market_snapshot_breakdown_daily
+    (snapshot_date, country, role_bucket, seniority, company_type, open_count, new_today)
+SELECT CURRENT_DATE,
+       coalesce(jp.country, 'other'),
+       CASE
+         WHEN jp.title ~* '(machine learning|\mml\M|\mai\M|data scien|data engineer|analytics|\mbi\M|data analyst)' THEN 'data_ml'
+         WHEN jp.title ~* '(devops|sre|site reliability|platform engineer|infrastructure|cloud|kubernetes)' THEN 'devops_platform'
+         WHEN jp.title ~* '(android|ios|mobile|react native|flutter)' THEN 'mobile'
+         WHEN jp.title ~* '(security|appsec|infosec)' THEN 'security'
+         WHEN jp.title ~* '(\mqa\M|quality|sdet|test engineer|automation engineer)' THEN 'qa'
+         WHEN jp.title ~* '(front.?end|\mui\M|react|angular|\mvue)' THEN 'frontend'
+         WHEN jp.title ~* '(back.?end|server|java\M|golang|\mgo\M|python|node|\.net|api)' THEN 'backend'
+         WHEN jp.title ~* '(full.?stack)' THEN 'fullstack'
+         WHEN jp.title ~* '(engineering manager|director|head of|\mvp\M|technical lead|tech lead)' THEN 'eng_management'
+         WHEN jp.title ~* '(engineer|developer|programmer|architect|software|\msde\M)' THEN 'software_other'
+         ELSE 'other'
+       END,
+       coalesce(jp.seniority, 'unknown'),
+       coalesce(co.company_type, 'unknown'),
+       count(*) FILTER (WHERE jp.status = 'open'),
+       count(*) FILTER (WHERE jp.posted_at >= CURRENT_DATE)
+FROM {{SCHEMA}}.job_posting jp
+LEFT JOIN {{SCHEMA}}.company co ON co.slug = jp.company_slug
+WHERE jp.status = 'open'
+GROUP BY 1, 2, 3, 4, 5
+"""
 
 
 async def _cmd_snapshot_market() -> int:
@@ -159,6 +188,12 @@ async def _cmd_snapshot_market() -> int:
                 json.dumps(data["by_company_type"]),
                 json.dumps(data["top_companies"]),
             )
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                "DELETE FROM public.jobs_market_snapshot_breakdown_daily "
+                "WHERE snapshot_date = CURRENT_DATE"
+            )
+            await conn.execute(_BREAKDOWN_SQL.replace("{{SCHEMA}}", settings.validated_schema()))
     finally:
         await pool.close()
     _p({"snapshot_market": "ok", "snapshot_date": "CURRENT_DATE", **data})

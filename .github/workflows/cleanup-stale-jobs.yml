@@ -1,8 +1,7 @@
 name: cleanup-stale-jobs
 
-# Every 6 hours: snapshot market analytics, THEN hard-delete postings older
-# than 1 day (by first_seen_at) — the board only carries jobs from the last
-# 24 hours. The snapshot step must run before hard-delete: once retention is
+# Daily (12:30 IST): snapshot market analytics, THEN hard-delete postings rows
+# not seen by a crawl in RETAIN_DAYS (3) or posted more than 30 days ago. The snapshot step must run before hard-delete: once retention is
 # down to 24h, public.jobs_market_snapshot_daily is the only surviving record
 # of a day's activity, so it has to be captured before the source rows it's
 # computed from get purged. FK cascades from crawler.job_posting are limited
@@ -11,7 +10,7 @@ name: cleanup-stale-jobs
 # pass; this is the safety net if that workflow is paused.
 on:
   schedule:
-    - cron: "27 */6 * * *"    # :27 past every 6th hour, offset from the 2h crawl cron
+    - cron: "0 7 * * *"    # 12:30 IST daily, 30 min before the 13:00 IST crawl
   workflow_dispatch: {}
 
 permissions:
@@ -28,7 +27,8 @@ jobs:
     env:
       LOCAL_DATABASE_URL: ${{ secrets.LOCAL_DATABASE_URL }}
       PGPIPE_SCHEMA: crawler
-      DELETE_AFTER_DAYS: "1"   # delete postings older than N days (first_seen_at)
+      RETAIN_DAYS: "3"               # delete rows not seen by a crawl for N days
+      MAX_POSTING_AGE_DAYS: "30"     # ...or posted (posted_at) more than N days ago
 
     steps:
       - name: Checkout
@@ -48,10 +48,10 @@ jobs:
           set -euo pipefail
           uv run --no-sync jobs snapshot-market | tee ../snapshot.json
 
-      - name: Hard-delete postings not seen in ${{ env.DELETE_AFTER_DAYS }} days
+      - name: Hard-delete rows unseen for ${{ env.RETAIN_DAYS }}d or posted >${{ env.MAX_POSTING_AGE_DAYS }}d ago
         run: |
           set -euo pipefail
-          uv run --no-sync jobs hard-delete --days "${DELETE_AFTER_DAYS}" | tee ../delete.json
+          uv run --no-sync jobs hard-delete --days "${RETAIN_DAYS}" | tee ../delete.json
           uv run --no-sync jobs prune | tee -a ../delete.json
 
       - name: Summary

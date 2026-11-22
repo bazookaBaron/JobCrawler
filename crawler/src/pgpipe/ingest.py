@@ -5,11 +5,13 @@ No scraper, no description fetch, no R2, no enrichment, no Redis.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
 import asyncpg
 import httpx
 
 from src.core.monitors import BoardGoneError, DiscoveredJob, get_discoverer
+from src.pgpipe.config import settings
 from src.pgpipe.country import classify_country
 from src.pgpipe.monitors_workday import discover_workday
 from src.pgpipe.posted_at import parse_posted_at
@@ -28,6 +30,10 @@ def _norm_employment(v: str | None) -> str | None:
     if not v:
         return None
     return _EMPLOYMENT_MAP.get(v.strip().lower(), v.strip().lower())
+
+
+def _aware(dt: datetime) -> datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _first(seq: list[str] | None) -> str | None:
@@ -161,9 +167,13 @@ async def crawl_board(
     jobs = _rows_from_result(result)
     records: list[tuple] = []
     dropped = 0
+    # Skip postings whose real posting date is older than the window; keep undated.
+    oldest = datetime.now(timezone.utc) - timedelta(days=settings.max_posting_age_days)
     for j in jobs:
         rec = _to_record(board["company_slug"], board["board_slug"], monitor_type, j)
         if rec is None:
+            continue
+        if rec[15] is not None and _aware(rec[15]) < oldest:  # rec[15]=posted_at
             continue
         if TECH_ONLY and not is_tech_role(rec[5], rec[11]):  # rec[5]=title, rec[11]=department
             dropped += 1
