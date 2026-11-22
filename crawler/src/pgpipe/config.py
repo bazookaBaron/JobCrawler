@@ -94,7 +94,7 @@ class Settings:
     # filter; undated postings are kept). Env: RETAIN_DAYS / MAX_POSTING_AGE_DAYS.
     retain_days: int = int(os.environ.get("RETAIN_DAYS") or os.environ.get("PGPIPE_RETAIN_DAYS") or 3)
     max_posting_age_days: int = int(
-        os.environ.get("MAX_POSTING_AGE_DAYS") or os.environ.get("PGPIPE_MAX_POSTING_AGE_DAYS") or 30
+        os.environ.get("MAX_POSTING_AGE_DAYS") or os.environ.get("PGPIPE_MAX_POSTING_AGE_DAYS") or 15
     )
 
     # Location gate at ingest: only postings classified into these countries
@@ -103,6 +103,15 @@ class Settings:
         c.upper() for c in _csv_lower("PGPIPE_COUNTRIES", "us,in")
     )
 
+    # Pool mix (enforced by `jobs finalize` / cleanup.enforce_mix and gated at
+    # ingest): tech roles are all kept; product-associated roles are capped at
+    # `product_share` of stored rows and US rows at `us_share` (newest first);
+    # 'other' (non-tech corporate) roles are dropped. Set a share to 0 to disable
+    # that cap; ROLE_FILTER=0 disables the role drop + product cap.
+    role_filter: bool = os.environ.get("ROLE_FILTER", "1").strip().lower() not in ("0", "false", "no")
+    product_share: float = _float("PRODUCT_SHARE", 0.10)
+    us_share: float = _float("US_SHARE", 0.10)
+
     # DB size guard: once pg_database_size() exceeds this many MB, ingest stops
     # INSERTing new rows (existing rows still get last_seen_at refreshed).
     max_db_mb: float = _float("MAX_DB_MB", 420.0)
@@ -110,7 +119,13 @@ class Settings:
     # asyncpg pool size per process. Workers hold a connection only for the
     # short claim/upsert transactions, so a handful suffices; keeping it small
     # lets 8 matrix shards (+ finalize) stay under Supabase's connection cap.
-    pool_max: int = _int("PGPIPE_POOL_MAX", 5)
+    # Default 2 (was 5): Supabase's session-mode pooler allows only ~15 clients
+    # in total, and 8 shards + linkedin + finalize must all fit under that.
+    pool_max: int = _int("PGPIPE_POOL_MAX", 2)
+
+    # Seconds to wait per shard index before connecting (shard i sleeps
+    # i * this), so the 8 matrix shards don't all hit the pooler in one burst.
+    shard_stagger_seconds: float = _float("PGPIPE_SHARD_STAGGER", 0.0)
 
     # Per-board paging caps for the rich monitors implemented in pgpipe.
     workday_gap_seconds: float = _float("PGPIPE_WORKDAY_GAP", 1.0)

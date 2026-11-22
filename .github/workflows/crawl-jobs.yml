@@ -5,7 +5,7 @@ name: crawl-jobs
 #   (b) AutoApply's boards (~14.5k)        (imported once: `jobs import-boards`, origin='autoapply')
 #   (c) LinkedIn guest search              (`jobs linkedin`, signed-out, polite, stops on 429/999)
 # for ALL roles (no tech-only filter), India + United States only, postings up
-# to 30 days old. The Postgres `crawler.job_board` table is the source of truth,
+# to 15 days old. The Postgres `crawler.job_board` table is the source of truth,
 # so the board crawl sees the union automatically.
 #
 # Shape:  prepare -> crawl x8 shards (parallel runners)  \
@@ -41,15 +41,15 @@ env:
   LOCAL_DATABASE_URL: ${{ secrets.LOCAL_DATABASE_URL }}   # Supabase Postgres URI
   PGPIPE_SCHEMA: crawler
   PGPIPE_CONCURRENCY: "12"
-  PGPIPE_POOL_MAX: "5"
+  PGPIPE_POOL_MAX: "2"
   # Crawl-budget split: ~70% of each pass goes to the big ATS providers
   # (greenhouse + workday), ~30% to the long tail.
   PGPIPE_PRIORITY_MONITORS: "greenhouse,workday"
   PGPIPE_PRIORITY_WEIGHT: "0.7"
-  # All roles, India + US only, postings up to 30 days old.
+  # All roles, India + US only, postings up to 15 days old.
   PGPIPE_TECH_ONLY: "0"
   PGPIPE_COUNTRIES: "us,in"
-  MAX_POSTING_AGE_DAYS: "30"
+  MAX_POSTING_AGE_DAYS: "15"
   # A row is deleted 3 days after a crawl last saw it.
   RETAIN_DAYS: "3"
   PGPIPE_CLOSE_AFTER_DAYS: "2"
@@ -92,6 +92,10 @@ jobs:
         working-directory: crawler
     env:
       PGPIPE_WORKER_ID: gha-shard-${{ matrix.shard }}
+      # Supabase session pooler caps ~15 clients: 8 shards x 1 conn + linkedin + finalize
+      # must fit, and shards connect 20 s apart (connect() also retries with backoff).
+      PGPIPE_POOL_MAX: "1"
+      PGPIPE_SHARD_STAGGER: "20"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -160,7 +164,7 @@ jobs:
           enable-cache: true
       - name: Install dependencies (locked)
         run: uv sync --frozen
-      - name: Retention - close stale (2d), hard-delete (unseen 3d / posted >30d), prune per-company cap
+      - name: Retention - close stale (2d), hard-delete (unseen 3d / posted >15d), prune per-company cap
         run: uv run --no-sync jobs finalize
       - name: Job summary
         if: always()

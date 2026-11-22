@@ -1,7 +1,7 @@
 name: cleanup-stale-jobs
 
 # Daily (12:30 IST): snapshot market analytics, THEN hard-delete postings rows
-# not seen by a crawl in RETAIN_DAYS (3) or posted more than 30 days ago. The snapshot step must run before hard-delete: once retention is
+# not seen by a crawl in RETAIN_DAYS (3) or posted more than 15 days ago. The snapshot step must run before hard-delete: once retention is
 # down to 24h, public.jobs_market_snapshot_daily is the only surviving record
 # of a day's activity, so it has to be captured before the source rows it's
 # computed from get purged. FK cascades from crawler.job_posting are limited
@@ -28,7 +28,7 @@ jobs:
       LOCAL_DATABASE_URL: ${{ secrets.LOCAL_DATABASE_URL }}
       PGPIPE_SCHEMA: crawler
       RETAIN_DAYS: "3"               # delete rows not seen by a crawl for N days
-      MAX_POSTING_AGE_DAYS: "30"     # ...or posted (posted_at) more than N days ago
+      MAX_POSTING_AGE_DAYS: "15"     # ...or posted (posted_at) more than N days ago
 
     steps:
       - name: Checkout

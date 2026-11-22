@@ -33,7 +33,9 @@ import httpx
 from src.pgpipe.board_import import slugify
 from src.pgpipe.config import settings
 from src.pgpipe.country import classify_country
+from src.pgpipe.cleanup import MixGate
 from src.pgpipe.dbguard import SizeGuard
+from src.pgpipe.role_classify import classify_role
 from src.pgpipe.posted_at import parse_posted_at
 from src.pgpipe.seniority import seniority_of
 
@@ -41,27 +43,36 @@ SEARCH_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/se
 PAGE_SIZE = 10
 LOCATIONS = ("India", "United States")
 
-# role-family query list: core tech titles + corporate / non-tech families
-QUERIES: tuple[str, ...] = (
-    # core tech
+# Role-family queries: tech families + product-associated roles only (the pool
+# mix is ~90% tech / ~10% product; corporate roles are not searched).
+TECH_QUERIES: tuple[str, ...] = (
     "software engineer", "backend developer", "frontend developer", "full stack developer",
-    "data engineer", "data scientist", "machine learning engineer", "devops engineer",
-    "cloud engineer", "qa engineer", "mobile developer", "cybersecurity analyst",
-    "security engineer",
-    # product / program / project
-    "product manager", "program manager", "project manager", "business analyst",
-    "scrum master", "data analyst",
-    # go-to-market
-    "sales manager", "account executive", "business development", "marketing manager",
-    "digital marketing", "customer success manager",
-    # finance / people / ops
-    "financial analyst", "accountant", "finance manager", "human resources",
-    "recruiter", "talent acquisition", "operations manager", "supply chain",
-    "procurement", "consultant", "legal counsel", "compliance",
-    # enterprise software consulting
-    "SAP consultant", "ERP consultant", "Salesforce consultant", "Workday consultant",
-    # design / healthcare
-    "ux designer", "product designer", "healthcare", "pharma", "clinical research",
+    "java developer", "python developer", "react developer", "node js developer", ".net developer",
+    "android developer", "ios developer", "mobile developer",
+    "data engineer", "data scientist", "machine learning engineer", "ai engineer", "data analyst",
+    "devops engineer", "site reliability engineer", "cloud engineer", "platform engineer", "kubernetes",
+    "security engineer", "cybersecurity analyst", "information security",
+    "qa engineer", "sdet", "test automation engineer",
+    "embedded engineer", "firmware engineer", "network engineer", "solutions architect",
+    "engineering manager", "technical lead", "software engineer intern", "associate software engineer",
+    "senior software engineer", "staff engineer", "principal engineer",
+)
+PRODUCT_QUERIES: tuple[str, ...] = (
+    "product manager", "product owner", "technical program manager", "project manager it",
+    "ux designer", "product designer", "business analyst", "product analyst",
+    "technical writer", "solutions engineer", "sales engineer", "customer success engineer",
+)
+QUERIES: tuple[str, ...] = TECH_QUERIES + PRODUCT_QUERIES
+
+# India-heavy plan: (location, queries, max_pages). India gets every query with
+# deep paging; the US only a short core list (US rows are capped at ~10% anyway).
+US_QUERIES: tuple[str, ...] = (
+    "software engineer", "data engineer", "machine learning engineer", "devops engineer",
+    "security engineer", "product manager",
+)
+PLAN: tuple[tuple[str, tuple[str, ...], int], ...] = (
+    ("India", QUERIES, 8),
+    ("United States", US_QUERIES, 2),
 )
 
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -112,8 +123,13 @@ def card_to_row(card: dict) -> dict | None:
     country = classify_country(card["location"], [card["location"]] if card["location"] else None)
     if country not in settings.countries:
         return None
+    family, category = classify_role(card["title"])
+    if settings.role_filter and family not in ("tech", "product"):
+        return None
     posted = parse_posted_at(card.get("posted") or None)
     return {
+        "role_family": family,
+        "role_category": category,
         "company_slug": slug,
         "company_name": card["company"],
         "external_id": card["id"],
@@ -180,9 +196,10 @@ async def fetch_page(client: httpx.AsyncClient, state: LinkedInState, params: di
 _UPSERT_LI = """
 WITH incoming AS (
     SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
-                         $6::text[], $7::text[], $8::text[], $9::text[], $10::timestamptz[])
+                         $6::text[], $7::text[], $8::text[], $9::text[], $10::timestamptz[],
+                         $11::text[], $12::text[])
          AS t(company_slug, external_id, url, title, location, date_posted, seniority,
-              country, titles_json, posted_at)
+              country, titles_json, posted_at, role_family, role_category)
 ),
 new_co AS (
     INSERT INTO company (slug, name, updated_at)
@@ -194,13 +211,13 @@ new_co AS (
 ins AS (
     INSERT INTO job_posting
         (company_slug, board_slug, source, external_id, url, title, titles, location,
-         locations, date_posted, seniority, country, posted_at, first_seen_at,
-         last_seen_at, status)
+         locations, date_posted, seniority, country, posted_at, role_family,
+         role_category, first_seen_at, last_seen_at, status)
     SELECT i.company_slug, NULL, 'linkedin', i.external_id, i.url, i.title,
            i.titles_json::jsonb,
            i.location,
            CASE WHEN i.location IS NULL THEN '[]'::jsonb ELSE jsonb_build_array(i.location) END,
-           i.date_posted, i.seniority, i.country, COALESCE(i.posted_at, now()), now(), now(), 'open'
+           i.date_posted, i.seniority, i.country, COALESCE(i.posted_at, now()), i.role_family, i.role_category, now(), now(), 'open'
     FROM incoming i
     WHERE NOT EXISTS (   -- same role already crawled from the company's own board
         SELECT 1 FROM job_posting p
@@ -236,7 +253,7 @@ async def store_rows(pool: asyncpg.Pool, rows: list[dict], guard: SizeGuard | No
     cols = list(zip(*[
         (r["company_slug"], r["external_id"], r["url"], r["title"], r["location"],
          r["date_posted"], r["seniority"], r["country"], json.dumps([r["title"]]),
-         r["posted_at"] or now)
+         r["posted_at"] or now, r["role_family"], r["role_category"])
         for r in rows
     ]))
     row = await pool.fetchrow(_UPSERT_LI, *[list(c) for c in cols])
@@ -270,8 +287,9 @@ def make_client() -> httpx.AsyncClient:
 async def run_linkedin(
     pool: asyncpg.Pool,
     *,
-    queries: tuple[str, ...] = QUERIES,
-    locations: tuple[str, ...] = LOCATIONS,
+    plan: tuple[tuple[str, tuple[str, ...], int], ...] | None = None,
+    queries: tuple[str, ...] | None = None,
+    locations: tuple[str, ...] | None = None,
     max_pages: int = 6,
     window_hours: float = 24.0,
     gap: tuple[float, float] = (2.0, 5.0),
@@ -280,8 +298,14 @@ async def run_linkedin(
     sleep=asyncio.sleep,
     guard: SizeGuard | None = None,
 ) -> dict:
+    if plan is None:
+        if queries is None and locations is None:
+            plan = PLAN                      # India-heavy tech + product plan
+        else:  # explicit override (tests / CLI --limit-queries)
+            plan = tuple((loc, queries or QUERIES, max_pages) for loc in (locations or LOCATIONS))
     state = LinkedInState()
     guard = guard or SizeGuard(pool)
+    mix = MixGate(pool)
     own = client is None
     client = client or make_client()
     tpr = f"r{int(round(window_hours * 3600))}" if window_hours else ""
@@ -290,11 +314,11 @@ async def run_linkedin(
     cards_seen = kept = pages = 0
     seen_ids: set[str] = set()
     try:
-        for loc in locations:
-            for q in queries:
+        for loc, loc_queries, loc_pages in plan:
+            for q in loc_queries:
                 if state.dead or (time_budget_s and time.monotonic() - started > time_budget_s):
                     break
-                for p in range(max_pages):
+                for p in range(loc_pages):
                     params = {"keywords": q, "location": loc, "start": p * PAGE_SIZE}
                     if tpr:
                         params["f_TPR"] = tpr
@@ -303,6 +327,7 @@ async def run_linkedin(
                         break
                     pages += 1
                     cards = parse_cards(html) if html else []
+                    await mix.refresh()
                     batch = []
                     for c in cards:
                         if c["id"] in seen_ids:
@@ -310,7 +335,7 @@ async def run_linkedin(
                         seen_ids.add(c["id"])
                         cards_seen += 1
                         r = card_to_row(c)
-                        if r:
+                        if r and mix.allow(r["role_family"], r["country"], r["posted_at"]):
                             batch.append(r)
                     kept += len(batch)
                     if batch:
@@ -332,8 +357,8 @@ async def run_linkedin(
         "kept_in_or_us": kept,
         **totals,
         "elapsed_s": round(time.monotonic() - started, 1),
-        "queries": len(queries),
-        "locations": list(locations),
+        "queries": sum(len(qs) for _, qs, _ in plan),
+        "locations": [loc for loc, _, _ in plan],
         "notes": state.log,
     }
 

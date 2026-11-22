@@ -13,6 +13,8 @@ import asyncpg
 
 from src.pgpipe import cleanup, queue
 from src.pgpipe.config import settings
+from src.pgpipe.db import with_retry
+from src.pgpipe.cleanup import MixGate
 from src.pgpipe.dbguard import SizeGuard
 from src.pgpipe.http import make_client
 from src.pgpipe.ingest import crawl_board, record_board_failure
@@ -28,18 +30,19 @@ async def _worker(
     stats: dict,
     shard: tuple[int, int] | None = None,
     guard: SizeGuard | None = None,
+    mix: MixGate | None = None,
 ) -> None:
     while time.monotonic() < deadline:
-        row = await queue.claim_one(pool, shard)
+        row = await with_retry(lambda: queue.claim_one(pool, shard), what=f"{name}-claim")
         if row is None:
             return  # queue drained
         qid, attempts, slug = row["queue_id"], row["attempts"], row["board_slug"]
         try:
             async with pol.slot(row["board_url"]):
                 res = await asyncio.wait_for(
-                    crawl_board(pool, row, http, guard), timeout=settings.board_timeout_seconds
+                    crawl_board(pool, row, http, guard, mix), timeout=settings.board_timeout_seconds
                 )
-            await queue.finish_ok(pool, qid)
+            await with_retry(lambda: queue.finish_ok(pool, qid), what=f"{name}-finish")
             stats["ok"] += 1
             stats["upserted"] += res["upserted"]
             stats["dropped_nontech"] += res["dropped_nontech"]
@@ -47,8 +50,8 @@ async def _worker(
             stats["suppressed"] += res["suppressed"]
         except Exception as exc:  # noqa: BLE001 - queue records + retries
             msg = f"{type(exc).__name__}: {exc}"
-            await record_board_failure(pool, slug, msg)
-            await queue.finish_err(pool, qid, attempts, msg)
+            await with_retry(lambda: record_board_failure(pool, slug, msg), what=f"{name}-fail")
+            await with_retry(lambda: queue.finish_err(pool, qid, attempts, msg), what=f"{name}-finish")
             stats["failed"] += 1
             stats["errors"].append(f"{slug}: {msg}")
 
@@ -79,6 +82,7 @@ async def run(
     )
 
     guard = SizeGuard(pool)
+    mix = MixGate(pool)
     stats = {"ok": 0, "failed": 0, "upserted": 0, "dropped_nontech": 0,
              "dropped_country": 0, "suppressed": 0, "errors": []}
     pol = Politeness()
@@ -86,7 +90,7 @@ async def run(
     try:
         await asyncio.gather(
             *[
-                _worker(f"w{i}", pool, http, pol, deadline, stats, shard, guard)
+                _worker(f"w{i}", pool, http, pol, deadline, stats, shard, guard, mix)
                 for i in range(settings.concurrency)
             ]
         )

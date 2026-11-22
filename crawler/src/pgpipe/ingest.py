@@ -18,6 +18,8 @@ from src.pgpipe.monitors_icims import discover_icims
 from src.pgpipe.monitors_workday import discover_workday
 from src.pgpipe.posted_at import parse_posted_at
 from src.pgpipe.seniority import seniority_of
+from src.pgpipe.cleanup import MixGate
+from src.pgpipe.role_classify import classify_role
 from src.pgpipe.tech_filter import TECH_ONLY, is_tech_role
 
 _EMPLOYMENT_MAP = {
@@ -98,6 +100,7 @@ def _to_record(company_slug: str, board_slug: str, source: str, job: DiscoveredJ
         seniority_of(_first(titles)),
         classify_country(primary_location, locations),
         parse_posted_at(raw_date_posted),
+        *classify_role(_first(titles), _department(job)),   # rec[16]=role_family, rec[17]=role_category
     )
 
 
@@ -105,9 +108,9 @@ _UPSERT = """
 INSERT INTO job_posting
     (company_slug, board_slug, source, external_id, url, title, titles,
      location, locations, location_type, employment_type, department, date_posted,
-     seniority, country, posted_at, first_seen_at, last_seen_at, status)
+     seniority, country, posted_at, role_family, role_category, first_seen_at, last_seen_at, status)
 VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10,$11,$12,$13,$14,$15,
-        COALESCE($16, now()), now(), now(), 'open')
+        COALESCE($16, now()), $17, $18, now(), now(), 'open')
 ON CONFLICT (company_slug, url) DO UPDATE SET
     board_slug      = EXCLUDED.board_slug,
     source          = EXCLUDED.source,
@@ -122,6 +125,8 @@ ON CONFLICT (company_slug, url) DO UPDATE SET
     date_posted     = EXCLUDED.date_posted,
     seniority       = EXCLUDED.seniority,
     country         = EXCLUDED.country,
+    role_family     = EXCLUDED.role_family,
+    role_category   = EXCLUDED.role_category,
     -- A source that stops reporting date_posted on a later crawl shouldn't
     -- blow away a real parsed value we already have.
     posted_at       = COALESCE(EXCLUDED.posted_at, job_posting.posted_at),
@@ -156,6 +161,7 @@ async def _discover(monitor_type: str, board_dict: dict, http: httpx.AsyncClient
 async def crawl_board(
     pool: asyncpg.Pool, board: asyncpg.Record, http: httpx.AsyncClient,
     guard: SizeGuard | None = None,
+    mix: MixGate | None = None,
 ) -> dict[str, int]:
     """Fetch + upsert one board. Returns {"upserted", "dropped_nontech",
     "dropped_country", "suppressed"}.
@@ -187,6 +193,9 @@ async def crawl_board(
     records: list[tuple] = []
     dropped = 0
     dropped_country = 0
+    dropped_mix = 0
+    if mix is not None:
+        await mix.refresh()
     # Skip postings whose real posting date is older than the window; keep undated.
     oldest = datetime.now(timezone.utc) - timedelta(days=settings.max_posting_age_days)
     for j in jobs:
@@ -198,8 +207,14 @@ async def crawl_board(
         if not keep_country(rec[14]):  # rec[14]=country; IN/US only
             dropped_country += 1
             continue
-        if TECH_ONLY and not is_tech_role(rec[5], rec[11]):  # rec[5]=title, rec[11]=department
+        if settings.role_filter and rec[16] not in ("tech", "product"):  # non-tech corporate role
             dropped += 1
+            continue
+        if TECH_ONLY and not is_tech_role(rec[5], rec[11]):  # legacy strict filter (env PGPIPE_TECH_ONLY)
+            dropped += 1
+            continue
+        if mix is not None and not mix.allow(rec[16], rec[14], rec[15]):  # at product/US cap & older than kept rows
+            dropped_mix += 1
             continue
         records.append(rec)
 

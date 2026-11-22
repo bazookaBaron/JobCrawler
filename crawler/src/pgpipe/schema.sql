@@ -144,6 +144,14 @@ ALTER TABLE {{SCHEMA}}.job_posting
 CREATE INDEX IF NOT EXISTS job_posting_posted_at_idx
     ON {{SCHEMA}}.job_posting(posted_at DESC, id DESC) WHERE status = 'open';
 
+-- Role mix classifier output (src/pgpipe/role_classify.py), set at ingest:
+-- role_family 'tech' | 'product' ('other' rows are dropped); role_category is
+-- the finer chart label (Software engineering, Data / ML / AI, ...).
+ALTER TABLE {{SCHEMA}}.job_posting ADD COLUMN IF NOT EXISTS role_family text;
+ALTER TABLE {{SCHEMA}}.job_posting ADD COLUMN IF NOT EXISTS role_category text;
+CREATE INDEX IF NOT EXISTS job_posting_role_family_idx
+    ON {{SCHEMA}}.job_posting(role_family, country);
+
 -- --- simple full-text search over title + company (no description) ----
 ALTER TABLE {{SCHEMA}}.job_posting
     ADD COLUMN IF NOT EXISTS search_tsv tsvector

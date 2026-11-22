@@ -17,6 +17,7 @@
     jobs close-stale [--days N]  status='closed' for postings unseen N days (def 1)
     jobs prune [--cap N]         keep newest N postings per company (def 400)
     jobs hard-delete [--days N]  DELETE postings older than N days by first_seen (def 1)
+    jobs reclassify [--all] [--enforce] [--dry-run]   role_family backfill + apply pool rules
     jobs snapshot-market         compute crawler.compute_market_snapshot() and
                                   upsert it into public.jobs_market_snapshot_daily
                                   for CURRENT_DATE (run BEFORE hard-delete)
@@ -87,6 +88,8 @@ async def _cmd_sync() -> int:
 
 async def _cmd_run(minutes: float, shard_raw: str | None, cleanup_after: bool) -> int:
     shard = pg_queue.parse_shard(shard_raw)
+    if shard and settings.shard_stagger_seconds > 0:
+        await asyncio.sleep(shard[0] * settings.shard_stagger_seconds)
     pool = await connect()
     try:
         summary = await run_pass(
@@ -109,11 +112,13 @@ async def _cmd_finalize() -> int:
         closed = await cleanup.close_stale(pool)
         deleted = await cleanup.hard_delete_stale(pool)
         pruned = await cleanup.prune_per_company(pool)
+        reclassified = await cleanup.reclassify(pool)          # legacy rows without role_family
+        mix = await cleanup.enforce_mix(pool)                  # role / country drop + 90/10 caps
         purged = await pg_queue.purge_finished(pool)
     finally:
         await pool.close()
     _p({"finalize": "ok", "closed": closed, "deleted_old": deleted, "pruned": pruned,
-        "queue_purged": purged})
+        "reclassified": reclassified, "mix": mix, "queue_purged": purged})
     return 0
 
 
@@ -139,16 +144,35 @@ async def _cmd_import_boards(sqlite_path: str | None, json_dir: str | None,
 
 async def _cmd_linkedin(max_pages: int, limit_queries: int | None, minutes: float | None,
                         window_hours: float) -> int:
-    queries = linkedin_source.QUERIES[:limit_queries] if limit_queries else linkedin_source.QUERIES
+    queries = linkedin_source.QUERIES[:limit_queries] if limit_queries else None
+    locations = ("India",) if limit_queries else None
     pool = await connect()
     try:
         summary = await linkedin_source.run_linkedin(
-            pool, queries=queries, max_pages=max_pages, window_hours=window_hours,
+            pool, queries=queries, locations=locations, max_pages=max_pages, window_hours=window_hours,
             time_budget_s=(minutes * 60.0) if minutes else None,
         )
     finally:
         await pool.close()
     _p(summary)
+    return 0
+
+
+async def _cmd_reclassify(all_rows: bool, enforce: bool, dry_run: bool) -> int:
+    """Backfill role_family/role_category (and optionally apply the pool rules
+    now: drop other-role / non-IN-US rows, trim product and US to their caps)."""
+    pool = await connect()
+    try:
+        await apply_schema(pool)
+        out: dict = {"before": await cleanup.mix_counts(pool)}
+        if not dry_run:
+            out["reclassified"] = await cleanup.reclassify(pool, only_null=not all_rows)
+        if enforce:
+            out["enforce"] = await cleanup.enforce_mix(pool, dry_run=dry_run)
+        out["after"] = await cleanup.mix_counts(pool)
+    finally:
+        await pool.close()
+    _p(out)
     return 0
 
 
@@ -204,19 +228,7 @@ INSERT INTO public.jobs_market_snapshot_breakdown_daily
     (snapshot_date, country, role_bucket, seniority, company_type, open_count, new_today)
 SELECT CURRENT_DATE,
        coalesce(jp.country, 'other'),
-       CASE
-         WHEN jp.title ~* '(machine learning|\mml\M|\mai\M|data scien|data engineer|analytics|\mbi\M|data analyst)' THEN 'data_ml'
-         WHEN jp.title ~* '(devops|sre|site reliability|platform engineer|infrastructure|cloud|kubernetes)' THEN 'devops_platform'
-         WHEN jp.title ~* '(android|ios|mobile|react native|flutter)' THEN 'mobile'
-         WHEN jp.title ~* '(security|appsec|infosec)' THEN 'security'
-         WHEN jp.title ~* '(\mqa\M|quality|sdet|test engineer|automation engineer)' THEN 'qa'
-         WHEN jp.title ~* '(front.?end|\mui\M|react|angular|\mvue)' THEN 'frontend'
-         WHEN jp.title ~* '(back.?end|server|java\M|golang|\mgo\M|python|node|\.net|api)' THEN 'backend'
-         WHEN jp.title ~* '(full.?stack)' THEN 'fullstack'
-         WHEN jp.title ~* '(engineering manager|director|head of|\mvp\M|technical lead|tech lead)' THEN 'eng_management'
-         WHEN jp.title ~* '(engineer|developer|programmer|architect|software|\msde\M)' THEN 'software_other'
-         ELSE 'other'
-       END,
+       coalesce(jp.role_category, 'unclassified'),
        coalesce(jp.seniority, 'unknown'),
        coalesce(co.company_type, 'unknown'),
        count(*) FILTER (WHERE jp.status = 'open'),
@@ -368,6 +380,10 @@ def main() -> None:
     pp.add_argument("--cap", type=int, default=None)
     hp = sub.add_parser("hard-delete")
     hp.add_argument("--days", type=int, default=None)
+    rc_p = sub.add_parser("reclassify")
+    rc_p.add_argument("--all", action="store_true", help="re-classify every row, not only NULL role_family")
+    rc_p.add_argument("--enforce", action="store_true", help="also drop other-role / non IN-US rows and trim caps")
+    rc_p.add_argument("--dry-run", action="store_true", help="with --enforce: count only, change nothing")
     sub.add_parser("snapshot-market")
     sub.add_parser("backfill-posted-at")
     sub.add_parser("stats")
@@ -395,6 +411,8 @@ def main() -> None:
         rc = asyncio.run(_cmd_prune(args.cap))
     elif args.cmd == "hard-delete":
         rc = asyncio.run(_cmd_hard_delete(args.days))
+    elif args.cmd == "reclassify":
+        rc = asyncio.run(_cmd_reclassify(args.all, args.enforce, args.dry_run))
     elif args.cmd == "snapshot-market":
         rc = asyncio.run(_cmd_snapshot_market())
     elif args.cmd == "backfill-posted-at":
