@@ -20,12 +20,14 @@ import httpx
 import structlog
 
 from src.core.monitors import DiscoveredJob
+from src.pgpipe.config import settings
 
 log = structlog.get_logger()
 
 _PAGE = 20
 _MAX_POSTINGS = 2000
 _MAX_PAGES = _MAX_POSTINGS // _PAGE
+_OLD_RE = re.compile(r"\d+\+\s*days?\s+ago", re.I)  # "Posted 30+ Days Ago"
 
 # https://{tenant}.{dc}.myworkdayjobs.com/[locale/]{site}[/...]
 _URL_RE = re.compile(
@@ -33,6 +35,57 @@ _URL_RE = re.compile(
     r"(?:(?P<locale>[a-z]{2}-[A-Za-z]{2})/)?(?P<site>[^/?#]+)",
     re.I,
 )
+
+
+class _Gate:
+    """Global min-gap between ANY two Workday requests from this process.
+    Workday rate-limits per client IP across all tenants (the per-host gate in
+    throttle.py is not enough: every tenant is a different host), and the board
+    crawl issues many sequential page requests, so gate each request."""
+
+    def __init__(self) -> None:
+        self._lock: asyncio.Lock | None = None
+        self._next = 0.0
+
+    async def wait(self, gap: float) -> None:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            delay = self._next - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next = loop.time() + gap
+
+
+    def cool_off(self, seconds: float) -> None:
+        try:
+            self._next = max(self._next, asyncio.get_running_loop().time() + seconds)
+        except RuntimeError:  # pragma: no cover
+            pass
+
+
+_gate = _Gate()
+_RETRY_WAITS = (8.0, 20.0, 45.0)
+
+
+async def _post(client: httpx.AsyncClient, url: str, body: dict, headers: dict) -> httpx.Response:
+    """POST with the global gate + patient retry on 429 / 503 (Retry-After honoured)."""
+    for attempt in range(len(_RETRY_WAITS) + 1):
+        await _gate.wait(settings.workday_gap_seconds)
+        resp = await client.post(url, json=body, headers=headers)
+        if resp.status_code not in (429, 503):
+            return resp
+        if attempt == len(_RETRY_WAITS):
+            # still refused after patient retries: cool the whole Workday lane for a minute
+            _gate.cool_off(60.0)
+            return resp
+        try:
+            wait = float(resp.headers.get("Retry-After", ""))
+        except ValueError:
+            wait = _RETRY_WAITS[attempt]
+        await asyncio.sleep(min(max(wait, 1.0), 60.0))
+    return resp  # pragma: no cover
 
 
 def _cfg(board: dict) -> tuple[str, str, str]:
@@ -95,14 +148,15 @@ async def discover_workday(board: dict, client: httpx.AsyncClient) -> list[Disco
     out: list[DiscoveredJob] = []
     seen: set[str] = set()
     total = None
-    for page in range(_MAX_PAGES):
+    max_pages = max(1, min(_MAX_PAGES, settings.workday_max_pages))
+    for page in range(max_pages):
         offset = page * _PAGE
         if total is not None and offset >= total:
             break
-        resp = await client.post(
-            api,
-            json={"limit": _PAGE, "offset": offset, "searchText": "", "appliedFacets": {}},
-            headers=headers,
+        resp = await _post(
+            client, api,
+            {"limit": _PAGE, "offset": offset, "searchText": "", "appliedFacets": {}},
+            headers,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -116,6 +170,10 @@ async def discover_workday(board: dict, client: httpx.AsyncClient) -> list[Disco
             if job and job.url not in seen:
                 seen.add(job.url)
                 out.append(job)
+        # Results come newest-first: once a whole page is "30+ days ago" the
+        # rest is outside the posting window, so stop paging.
+        if all(_OLD_RE.search(p.get("postedOn") or "") for p in postings):
+            break
         if len(postings) < _PAGE:
             break
         await asyncio.sleep(0)  # cooperative; politeness gate handles real spacing

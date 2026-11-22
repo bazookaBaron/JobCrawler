@@ -1,20 +1,33 @@
 name: crawl-jobs
 
-# $0 compute: one scheduled GitHub Actions job. Single process, NO Redis, no
-# server. `jobs run` reclaims stale queue rows, enqueues every enabled board,
-# crawls them with an in-process politeness gate, upserts compact rows into the
-# dedicated `crawler` Postgres schema, then hard-deletes any posting older than
-# 1 day (first_seen_at) and trims each company to its newest 400. The board
-# only ever carries jobs from the last 24 hours.
+# $0 compute. Daily crawl over the UNION of
+#   (a) JobCrawler's own boards            (data/boards.csv  -> `jobs sync`)
+#   (b) AutoApply's boards (~14.5k)        (imported once: `jobs import-boards`, origin='autoapply')
+#   (c) LinkedIn guest search              (`jobs linkedin`, signed-out, polite, stops on 429/999)
+# for ALL roles (no tech-only filter), India + United States only, postings up
+# to 30 days old. The Postgres `crawler.job_board` table is the source of truth,
+# so the board crawl sees the union automatically.
 #
-# CRON: once a day at 13:00 IST (07:30 UTC); formerly every 2 hours (repo is public -> unlimited free Actions
-# minutes, no cost constraint). Check the "crawl" step duration against
-# RUN_MINUTES / the job timeout. ~516 boards at concurrency 12 with ATS
-# politeness (~0.6s per shared host) is roughly 5-12 min.
+# Shape:  prepare -> crawl x8 shards (parallel runners)  \
+#                 -> linkedin (own runner / own IP)        > finalize (retention, once)
+# Each shard claims only boards whose hash(board_slug) % 8 == shard, so no board
+# is crawled twice and per-host politeness (~0.6s gap per ATS host) holds per runner.
+#
+# DB size guard: rows are lean (no descriptions). If pg_database_size exceeds
+# MAX_DB_MB (420) ingest stops INSERTing new rows (still refreshes last_seen_at).
+#
+# CRON: once a day at 13:00 IST (07:30 UTC). Repo is public -> unlimited Actions minutes.
 on:
   schedule:
     - cron: "30 7 * * *"   # 13:00 IST daily
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: "Per-shard crawl budget in minutes"
+        default: "300"
+      linkedin:
+        description: "Run the LinkedIn step (true/false)"
+        default: "true"
 
 concurrency:
   group: crawl-jobs
@@ -23,70 +36,140 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Repo -> Settings -> Secrets and variables -> Actions -> New repository secret
+  LOCAL_DATABASE_URL: ${{ secrets.LOCAL_DATABASE_URL }}   # Supabase Postgres URI
+  PGPIPE_SCHEMA: crawler
+  PGPIPE_CONCURRENCY: "12"
+  PGPIPE_POOL_MAX: "5"
+  # Crawl-budget split: ~70% of each pass goes to the big ATS providers
+  # (greenhouse + workday), ~30% to the long tail.
+  PGPIPE_PRIORITY_MONITORS: "greenhouse,workday"
+  PGPIPE_PRIORITY_WEIGHT: "0.7"
+  # All roles, India + US only, postings up to 30 days old.
+  PGPIPE_TECH_ONLY: "0"
+  PGPIPE_COUNTRIES: "us,in"
+  MAX_POSTING_AGE_DAYS: "30"
+  # A row is deleted 3 days after a crawl last saw it.
+  RETAIN_DAYS: "3"
+  PGPIPE_CLOSE_AFTER_DAYS: "2"
+  MAX_DB_MB: "420"
+
 jobs:
-  crawl:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: crawler
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install dependencies (locked)
+        run: uv sync --frozen
+      - name: Apply schema (idempotent)
+        run: uv run --no-sync jobs migrate
+      - name: Sync curated companies + boards (CSV -> Postgres; imported boards untouched)
+        run: uv run --no-sync jobs sync
+      - name: DB size before
+        run: uv run --no-sync jobs db-size
+
+  crawl:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     defaults:
       run:
         shell: bash
         working-directory: crawler
     env:
-      # Repo -> Settings -> Secrets and variables -> Actions -> New repository secret
-      LOCAL_DATABASE_URL: ${{ secrets.LOCAL_DATABASE_URL }}   # Supabase Postgres URI
-      PGPIPE_SCHEMA: crawler
-      PGPIPE_CONCURRENCY: "12"
-      RUN_MINUTES: "20"
-      # Crawl-budget split: ~70% of each pass goes to the big ATS providers
-      # (greenhouse + workday), ~30% to the long tail. Both groups keep
-      # draining; if one empties the other takes the whole remaining budget.
-      PGPIPE_PRIORITY_MONITORS: "greenhouse,workday"
-      PGPIPE_PRIORITY_WEIGHT: "0.7"
-      # Board retention: keep only jobs first seen in the last N days; older
-      # rows are hard-deleted at the end of every pass.
-      # Fresh pool: keep postings up to 30 days old (by posting date); a row
-      # is deleted 3 days after a crawl last saw it.
-      MAX_POSTING_AGE_DAYS: "30"
-      RETAIN_DAYS: "3"
-      PGPIPE_CLOSE_AFTER_DAYS: "2"
-
+      PGPIPE_WORKER_ID: gha-shard-${{ matrix.shard }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up uv + Python
-        uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.13"
           enable-cache: true
-
       - name: Install dependencies (locked)
         run: uv sync --frozen
-
-      - name: Apply schema (idempotent)
-        run: uv run --no-sync jobs migrate
-
-      - name: Sync curated companies + boards (CSV -> Postgres)
-        run: uv run --no-sync jobs sync | tee ../sync.json
-
-      - name: Crawl (bounded) + close stale (2d) + prune per-company cap (400)
+      - name: Crawl shard ${{ matrix.shard }}/8 (bounded; retention runs in finalize)
         run: |
           set -euo pipefail
-          uv run --no-sync jobs run --minutes "${RUN_MINUTES}" | tee ../run.json
+          MIN="${{ github.event.inputs.run_minutes || '300' }}"
+          uv run --no-sync jobs run --minutes "$MIN" --shard "${{ matrix.shard }}/8" --no-cleanup | tee ../run.json
+      - name: Shard summary
+        if: always()
+        run: |
+          {
+            echo "### crawl shard ${{ matrix.shard }}/8"
+            echo '```json'; head -c 6000 ../run.json 2>/dev/null || echo '{}'; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
+  linkedin:
+    needs: prepare
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.linkedin != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    continue-on-error: true       # LinkedIn blocking datacenter IPs must never fail the crawl
+    defaults:
+      run:
+        shell: bash
+        working-directory: crawler
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install dependencies (locked)
+        run: uv sync --frozen
+      - name: LinkedIn guest search (signed-out; 24h window; stops after 3 consecutive 429/999)
+        run: |
+          set -euo pipefail
+          uv run --no-sync jobs linkedin --max-pages 6 --minutes 120 --window-hours 24 | tee ../linkedin.json
+      - name: LinkedIn summary
+        if: always()
+        run: |
+          {
+            echo "### linkedin"
+            echo '```json'; cat ../linkedin.json 2>/dev/null || echo '{}'; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  finalize:
+    needs: [crawl, linkedin]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: crawler
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install dependencies (locked)
+        run: uv sync --frozen
+      - name: Retention - close stale (2d), hard-delete (unseen 3d / posted >30d), prune per-company cap
+        run: uv run --no-sync jobs finalize
       - name: Job summary
         if: always()
         run: |
           set -uo pipefail
           {
-            echo "## crawl-jobs"
-            echo
-            echo '### sync'
-            echo '```json'; cat ../sync.json 2>/dev/null || echo '{}'; echo '```'
-            echo '### run'
-            echo '```json'; cat ../run.json 2>/dev/null || echo '{}'; echo '```'
+            echo "## crawl-jobs (union: JobCrawler + AutoApply boards + LinkedIn)"
+            echo '### db size'
+            echo '```json'; uv run --no-sync jobs db-size 2>&1 || echo '{}'; echo '```'
             echo '### db stats'
-            echo '```json'
-            uv run --no-sync jobs stats 2>&1 || echo '{"stats":"unavailable"}'
-            echo '```'
+            echo '```json'; uv run --no-sync jobs stats 2>&1 || echo '{"stats":"unavailable"}'; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

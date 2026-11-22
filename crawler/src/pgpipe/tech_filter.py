@@ -1,6 +1,6 @@
 """is_tech_role(title, department) — keep engineering, ML / data science,
 applied & security research, and quant roles. Applied in ingest.py before
-upsert when PGPIPE_TECH_ONLY=1 (the default).
+upsert only when PGPIPE_TECH_ONLY=1 (default OFF: all roles are kept).
 
 BLOCK wins: a title that matches both an ALLOW and a BLOCK pattern is dropped.
 """
@@ -9,7 +9,9 @@ from __future__ import annotations
 import os
 import re
 
-TECH_ONLY = (os.environ.get("PGPIPE_TECH_ONLY", "1").strip() not in ("0", "false", "no", ""))
+# Default OFF: the board carries ALL roles (corporate/non-tech included). Set
+# PGPIPE_TECH_ONLY=1 to restore the old engineering-only ingest filter.
+TECH_ONLY = (os.environ.get("PGPIPE_TECH_ONLY", "0").strip() in ("1", "true", "yes"))
 
 # --- ALLOW: role is technical if any of these hit (case-insensitive) --------
 _ALLOW_SRC = [

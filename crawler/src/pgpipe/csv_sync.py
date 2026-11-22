@@ -80,6 +80,7 @@ async def sync(pool: asyncpg.Pool) -> dict[str, int]:
                 board_url = EXCLUDED.board_url,
                 monitor_type = EXCLUDED.monitor_type,
                 monitor_config = EXCLUDED.monitor_config,
+                origin = 'csv',
                 is_enabled = true,
                 updated_at = now()
             """,
@@ -99,7 +100,7 @@ async def sync(pool: asyncpg.Pool) -> dict[str, int]:
         await conn.execute(
             """
             UPDATE job_board SET is_enabled = false, updated_at = now()
-            WHERE is_enabled = true AND board_slug <> ALL($1::text[])
+            WHERE is_enabled = true AND origin = 'csv' AND board_slug <> ALL($1::text[])
             """,
             present,
         )

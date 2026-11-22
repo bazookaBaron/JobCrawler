@@ -97,6 +97,26 @@ class Settings:
         os.environ.get("MAX_POSTING_AGE_DAYS") or os.environ.get("PGPIPE_MAX_POSTING_AGE_DAYS") or 30
     )
 
+    # Location gate at ingest: only postings classified into these countries
+    # (src/pgpipe/country.py) are stored. Unclassifiable / 'other' are dropped.
+    countries: tuple[str, ...] = tuple(
+        c.upper() for c in _csv_lower("PGPIPE_COUNTRIES", "us,in")
+    )
+
+    # DB size guard: once pg_database_size() exceeds this many MB, ingest stops
+    # INSERTing new rows (existing rows still get last_seen_at refreshed).
+    max_db_mb: float = _float("MAX_DB_MB", 420.0)
+
+    # asyncpg pool size per process. Workers hold a connection only for the
+    # short claim/upsert transactions, so a handful suffices; keeping it small
+    # lets 8 matrix shards (+ finalize) stay under Supabase's connection cap.
+    pool_max: int = _int("PGPIPE_POOL_MAX", 5)
+
+    # Per-board paging caps for the rich monitors implemented in pgpipe.
+    workday_gap_seconds: float = _float("PGPIPE_WORKDAY_GAP", 1.0)
+    workday_max_pages: int = _int("PGPIPE_WORKDAY_MAX_PAGES", 50)
+    icims_max_pages: int = _int("PGPIPE_ICIMS_MAX_PAGES", 25)
+
     worker_id: str = os.environ.get("PGPIPE_WORKER_ID", "").strip() or f"gha-{os.getpid()}"
 
     def validated_schema(self) -> str:

@@ -14,8 +14,13 @@ A trimmed, **$0-budget** job-posting crawler, adapted from the crawler of
   quant, GenAI, infra, security), ~516 boards, **rich HTTP monitors only**
   (Greenhouse, Ashby, Lever, Recruitee, Gem, Oracle HCM, Amazon, **Workday** via
   a compact CXS-API monitor). No browser, no scrapers, **no descriptions stored**.
-- **Tech-only** — a title/department filter (`PGPIPE_TECH_ONLY`, default on)
-  keeps engineering / applied-science / quant-dev roles and drops the rest.
+- **All roles, India + US only** — the title filter is now OFF by default
+  (`PGPIPE_TECH_ONLY=1` restores engineering-only); postings are kept only when
+  classified IN/US (`PGPIPE_COUNTRIES`), up to 30 days old. The daily crawl covers
+  the union of this repo's boards, ~14.5k imported AutoApply boards
+  (greenhouse/ashby/lever/workday/icims/successfactors, `jobs import-boards`) and
+  LinkedIn guest search (`jobs linkedin`), sharded 8-way in Actions. A DB size
+  guard (`MAX_DB_MB`, default 420) stops inserting new rows when the DB is full.
   Every posting is tagged with a `seniority` bucket
   (intern/junior/mid/senior/staff/principal/unknown).
 - **Search + analytics** — Postgres FTS (`search/jobs_search.sql`) and a
@@ -62,6 +67,11 @@ uv run --no-sync jobs run [--minutes 20]       one bounded crawl pass
 uv run --no-sync jobs close-stale [--days 3]   status='closed' for postings unseen N days
 uv run --no-sync jobs prune [--cap 400]        keep newest N postings per company
 uv run --no-sync jobs hard-delete [--days 5]   DELETE postings unseen N days
+uv run --no-sync jobs run --shard I/N --no-cleanup   crawl one shard of the boards (matrix job)
+uv run --no-sync jobs finalize                 close-stale + hard-delete + prune, once after all shards
+uv run --no-sync jobs import-boards --from-sqlite DB.sqlite --json DIR [--dry-run]
+uv run --no-sync jobs linkedin [--max-pages 6] LinkedIn guest search -> source='linkedin'
+uv run --no-sync jobs db-size                  pg_database_size + per-table sizes
 uv run --no-sync jobs stats                    row counts
 ```
 

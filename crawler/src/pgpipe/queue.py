@@ -20,13 +20,52 @@ _CLAIM_SELECT = """
     SELECT q.id, q.board_slug
     FROM crawl_queue q
     JOIN job_board b ON b.board_slug = q.board_slug
-    WHERE q.status = 'pending'{extra}
+    WHERE q.status = 'pending'{extra}{shard}
     ORDER BY q.id
     FOR UPDATE OF q SKIP LOCKED
     LIMIT 1
 """
 _ONLY_PRIORITY = " AND b.monitor_type = ANY($1::text[])"
 _NON_PRIORITY = " AND NOT (b.monitor_type = ANY($1::text[]))"
+
+
+def shard_clause(shard: tuple[int, int] | None, col: str = "b.board_slug") -> str:
+    """SQL fragment restricting to one shard of the board set (i of n), keyed on
+    a stable hash of board_slug so every board lands in exactly one shard.
+    Both numbers are validated ints, never user text."""
+    if not shard:
+        return ""
+    i, n = int(shard[0]), int(shard[1])
+    if n < 1 or not (0 <= i < n):
+        raise ValueError(f"bad shard {shard!r}: need 0 <= i < n")
+    return f" AND mod(abs(hashtext({col})::bigint), {n}) = {i}"
+
+
+def parse_shard(raw: str | None) -> tuple[int, int] | None:
+    """'2/8' -> (2, 8); '' / None -> None."""
+    if not raw or not raw.strip():
+        return None
+    a, _, b = raw.strip().partition("/")
+    shard = (int(a), int(b))
+    shard_clause(shard)  # validate
+    return shard
+
+
+async def purge_finished(pool: asyncpg.Pool, keep_hours: int = 30) -> int:
+    """Delete finished (done/error) queue rows older than `keep_hours`. Each run
+    enqueues one row per board, so without this the table grows by ~#boards a day."""
+    async with pool.acquire() as conn:
+        n = await conn.fetchval(
+            f"""
+            WITH d AS (
+                DELETE FROM crawl_queue
+                WHERE status IN ('done', 'error')
+                  AND coalesce(finished_at, enqueued_at) < now() - interval '{int(keep_hours)} hours'
+                RETURNING 1
+            ) SELECT count(*) FROM d
+            """
+        )
+    return int(n or 0)
 
 
 async def reclaim_stale(pool: asyncpg.Pool) -> int:
@@ -47,7 +86,7 @@ async def reclaim_stale(pool: asyncpg.Pool) -> int:
     return int(row or 0)
 
 
-async def enqueue_due(pool: asyncpg.Pool) -> int:
+async def enqueue_due(pool: asyncpg.Pool, shard: tuple[int, int] | None = None) -> int:
     """Insert a 'pending' row for every enabled board that has no live task.
 
     The partial unique index crawl_queue_live_board_uniq makes this safe to
@@ -60,7 +99,7 @@ async def enqueue_due(pool: asyncpg.Pool) -> int:
                 INSERT INTO crawl_queue (board_slug, company_slug, status)
                 SELECT b.board_slug, b.company_slug, 'pending'
                 FROM job_board b
-                WHERE b.is_enabled
+                WHERE b.is_enabled{shard}
                   AND NOT EXISTS (
                       SELECT 1 FROM crawl_queue q
                       WHERE q.board_slug = b.board_slug
@@ -70,36 +109,37 @@ async def enqueue_due(pool: asyncpg.Pool) -> int:
                 RETURNING 1
             )
             SELECT count(*) FROM ins
-            """
+            """.replace("{shard}", shard_clause(shard))
         )
     return int(row or 0)
 
 
-def _claim_plan() -> tuple[tuple[str, list], ...]:
+def _claim_plan(shard: tuple[int, int] | None = None) -> tuple[tuple[str, list], ...]:
     """Which SELECT(s) to try, in order. With priority weighting on, pick a
     preferred group per call (priority vs. the long tail) by weight, and keep
     the other as a fallback so neither group starves when one drains."""
+    sc = shard_clause(shard)
     prio = list(settings.priority_monitor_types)
     weight = settings.priority_weight
     if not prio or not (0.0 < weight < 1.0):
-        return ((_CLAIM_SELECT.format(extra=""), []),)
+        return ((_CLAIM_SELECT.format(extra="", shard=sc), []),)
     if random.random() < weight:
         first, second = _ONLY_PRIORITY, _NON_PRIORITY
     else:
         first, second = _NON_PRIORITY, _ONLY_PRIORITY
     return (
-        (_CLAIM_SELECT.format(extra=first), [prio]),
-        (_CLAIM_SELECT.format(extra=second), [prio]),
+        (_CLAIM_SELECT.format(extra=first, shard=sc), [prio]),
+        (_CLAIM_SELECT.format(extra=second, shard=sc), [prio]),
     )
 
 
-async def claim_one(pool: asyncpg.Pool) -> asyncpg.Record | None:
+async def claim_one(pool: asyncpg.Pool, shard: tuple[int, int] | None = None) -> asyncpg.Record | None:
     """Atomically claim a pending task (biased toward settings.priority_
     monitor_types — see _claim_plan). Returns the board row joined with
     job_board, or None when the queue is drained."""
     async with pool.acquire() as conn, conn.transaction():
         task = None
-        for sql, params in _claim_plan():
+        for sql, params in _claim_plan(shard):
             task = await conn.fetchrow(sql, *params)
             if task is not None:
                 break

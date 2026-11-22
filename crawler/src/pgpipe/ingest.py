@@ -13,6 +13,8 @@ import httpx
 from src.core.monitors import BoardGoneError, DiscoveredJob, get_discoverer
 from src.pgpipe.config import settings
 from src.pgpipe.country import classify_country
+from src.pgpipe.dbguard import SizeGuard
+from src.pgpipe.monitors_icims import discover_icims
 from src.pgpipe.monitors_workday import discover_workday
 from src.pgpipe.posted_at import parse_posted_at
 from src.pgpipe.seniority import seniority_of
@@ -128,18 +130,35 @@ ON CONFLICT (company_slug, url) DO UPDATE SET
 """
 
 
+# DB-full mode: refresh last_seen_at on rows we already hold, insert nothing.
+_TOUCH = (
+    "UPDATE job_posting SET last_seen_at = now(), status = 'open' "
+    "WHERE company_slug = $1 AND url = $2"
+)
+
+
+def keep_country(country: str | None) -> bool:
+    """Location gate: only postings classified into settings.countries (IN/US)."""
+    return country in settings.countries
+
+
 async def _discover(monitor_type: str, board_dict: dict, http: httpx.AsyncClient):
     # Compact rich Workday monitor (src/pgpipe/monitors_workday.py) — NOT
     # jobseek's URL-only src/core/monitors/workday.py.
     if monitor_type == "workday":
         return await discover_workday(board_dict, http)
+    # jobseek's icims monitor is URL-only; use the rich listing parser.
+    if monitor_type == "icims":
+        return await discover_icims(board_dict, http)
     return await get_discoverer(monitor_type)(board_dict, http)
 
 
 async def crawl_board(
-    pool: asyncpg.Pool, board: asyncpg.Record, http: httpx.AsyncClient
+    pool: asyncpg.Pool, board: asyncpg.Record, http: httpx.AsyncClient,
+    guard: SizeGuard | None = None,
 ) -> dict[str, int]:
-    """Fetch + upsert one board. Returns {"upserted", "dropped_nontech"}.
+    """Fetch + upsert one board. Returns {"upserted", "dropped_nontech",
+    "dropped_country", "suppressed"}.
     Raises on failure (caller records + retries via the queue).
     BoardGoneError disables the board."""
     monitor_type = board["monitor_type"]
@@ -162,11 +181,12 @@ async def crawl_board(
                 "last_attempt_at=now(), updated_at=now() WHERE board_slug=$1",
                 board["board_slug"], f"gone: {gone}",
             )
-        return {"upserted": 0, "dropped_nontech": 0}
+        return {"upserted": 0, "dropped_nontech": 0, "dropped_country": 0, "suppressed": 0}
 
     jobs = _rows_from_result(result)
     records: list[tuple] = []
     dropped = 0
+    dropped_country = 0
     # Skip postings whose real posting date is older than the window; keep undated.
     oldest = datetime.now(timezone.utc) - timedelta(days=settings.max_posting_age_days)
     for j in jobs:
@@ -175,13 +195,22 @@ async def crawl_board(
             continue
         if rec[15] is not None and _aware(rec[15]) < oldest:  # rec[15]=posted_at
             continue
+        if not keep_country(rec[14]):  # rec[14]=country; IN/US only
+            dropped_country += 1
+            continue
         if TECH_ONLY and not is_tech_role(rec[5], rec[11]):  # rec[5]=title, rec[11]=department
             dropped += 1
             continue
         records.append(rec)
 
+    suppressed = 0
+    blocked = bool(guard and records and await guard.refresh())
     async with pool.acquire() as conn, conn.transaction():
-        if records:
+        if records and blocked:
+            # DB over MAX_DB_MB: keep existing rows fresh, insert nothing new.
+            suppressed = len(records)
+            await conn.executemany(_TOUCH, [(r[0], r[4]) for r in records])
+        elif records:
             await conn.executemany(_UPSERT, records)
         await conn.execute(
             """
@@ -193,7 +222,12 @@ async def crawl_board(
             """,
             board["board_slug"], len(records),
         )
-    return {"upserted": len(records), "dropped_nontech": dropped}
+    return {
+        "upserted": 0 if blocked else len(records),
+        "dropped_nontech": dropped,
+        "dropped_country": dropped_country,
+        "suppressed": suppressed,
+    }
 
 
 async def record_board_failure(pool: asyncpg.Pool, board_slug: str, err: str) -> None:

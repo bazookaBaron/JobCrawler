@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.job_board (
 );
 CREATE INDEX IF NOT EXISTS job_board_company_idx ON {{SCHEMA}}.job_board(company_slug);
 
+-- where a board row came from: 'csv' (data/boards.csv, owned by `jobs sync`,
+-- which disables csv boards that vanish from the file) or e.g. 'autoapply'
+-- (`jobs import-boards`; `jobs sync` never touches those).
+ALTER TABLE {{SCHEMA}}.job_board
+    ADD COLUMN IF NOT EXISTS origin text NOT NULL DEFAULT 'csv';
+
 -- --- work queue (Postgres replaces Upstash Redis) ----------------------
 -- One row per board per crawl cycle. Claimed with
 --   SELECT ... FOR UPDATE SKIP LOCKED

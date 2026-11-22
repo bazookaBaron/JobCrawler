@@ -13,6 +13,7 @@ import asyncpg
 
 from src.pgpipe import cleanup, queue
 from src.pgpipe.config import settings
+from src.pgpipe.dbguard import SizeGuard
 from src.pgpipe.http import make_client
 from src.pgpipe.ingest import crawl_board, record_board_failure
 from src.pgpipe.throttle import Politeness
@@ -25,21 +26,25 @@ async def _worker(
     pol: Politeness,
     deadline: float,
     stats: dict,
+    shard: tuple[int, int] | None = None,
+    guard: SizeGuard | None = None,
 ) -> None:
     while time.monotonic() < deadline:
-        row = await queue.claim_one(pool)
+        row = await queue.claim_one(pool, shard)
         if row is None:
             return  # queue drained
         qid, attempts, slug = row["queue_id"], row["attempts"], row["board_slug"]
         try:
             async with pol.slot(row["board_url"]):
                 res = await asyncio.wait_for(
-                    crawl_board(pool, row, http), timeout=settings.board_timeout_seconds
+                    crawl_board(pool, row, http, guard), timeout=settings.board_timeout_seconds
                 )
             await queue.finish_ok(pool, qid)
             stats["ok"] += 1
             stats["upserted"] += res["upserted"]
             stats["dropped_nontech"] += res["dropped_nontech"]
+            stats["dropped_country"] += res["dropped_country"]
+            stats["suppressed"] += res["suppressed"]
         except Exception as exc:  # noqa: BLE001 - queue records + retries
             msg = f"{type(exc).__name__}: {exc}"
             await record_board_failure(pool, slug, msg)
@@ -48,7 +53,16 @@ async def _worker(
             stats["errors"].append(f"{slug}: {msg}")
 
 
-async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
+async def run(
+    pool: asyncpg.Pool,
+    *,
+    time_budget_seconds: float,
+    shard: tuple[int, int] | None = None,
+    cleanup_after: bool = True,
+) -> dict:
+    """One bounded pass. `shard=(i, n)` crawls only boards whose hash falls in
+    shard i of n (matrix jobs); `cleanup_after=False` skips close/delete/prune
+    (run those once, in a final job: `jobs finalize`)."""
     started = time.monotonic()
     deadline = started + time_budget_seconds
 
@@ -57,31 +71,44 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
     )
 
     reclaimed = await queue.reclaim_stale(pool)
-    enqueued = await queue.enqueue_due(pool)
-    pending = await pool.fetchval("SELECT count(*) FROM crawl_queue WHERE status='pending'")
+    queue_purged = await queue.purge_finished(pool)
+    enqueued = await queue.enqueue_due(pool, shard)
+    pending = await pool.fetchval(
+        "SELECT count(*) FROM crawl_queue q JOIN job_board b ON b.board_slug = q.board_slug "
+        "WHERE q.status='pending'" + queue.shard_clause(shard)
+    )
 
-    stats = {"ok": 0, "failed": 0, "upserted": 0, "dropped_nontech": 0, "errors": []}
+    guard = SizeGuard(pool)
+    stats = {"ok": 0, "failed": 0, "upserted": 0, "dropped_nontech": 0,
+             "dropped_country": 0, "suppressed": 0, "errors": []}
     pol = Politeness()
     http = make_client()
     try:
         await asyncio.gather(
             *[
-                _worker(f"w{i}", pool, http, pol, deadline, stats)
+                _worker(f"w{i}", pool, http, pol, deadline, stats, shard, guard)
                 for i in range(settings.concurrency)
             ]
         )
     finally:
         await http.aclose()
 
-    remaining = await pool.fetchval("SELECT count(*) FROM crawl_queue WHERE status='pending'")
-    closed = await cleanup.close_stale(pool)
-    deleted_old = await cleanup.hard_delete_stale(pool)  # not seen in RETAIN_DAYS or posted > MAX_POSTING_AGE_DAYS ago
-    pruned = await cleanup.prune_per_company(pool)
+    remaining = await pool.fetchval(
+        "SELECT count(*) FROM crawl_queue q JOIN job_board b ON b.board_slug = q.board_slug "
+        "WHERE q.status='pending'" + queue.shard_clause(shard)
+    )
+    closed = deleted_old = pruned = 0
+    if cleanup_after:
+        closed = await cleanup.close_stale(pool)
+        deleted_old = await cleanup.hard_delete_stale(pool)  # not seen in RETAIN_DAYS or posted > MAX_POSTING_AGE_DAYS ago
+        pruned = await cleanup.prune_per_company(pool)
 
     kept = stats["upserted"]
     dropped = stats["dropped_nontech"]
     seen = kept + dropped
     notes = (
+        f"shard={shard} queue_purged={queue_purged} db_mb={guard.size_mb:.0f} "
+        f"suppressed_by_size_guard={stats['suppressed']} dropped_country={stats['dropped_country']} "
         f"reclaimed={reclaimed} enqueued={enqueued} remaining_pending={remaining} "
         f"deleted_old={deleted_old} "
         f"tech_filter: kept={kept} dropped_nontech={dropped} "
@@ -116,6 +143,10 @@ async def run(pool: asyncpg.Pool, *, time_budget_seconds: float) -> dict:
         "boards_remaining_pending": int(remaining or 0),
         "postings_upserted": stats["upserted"],
         "postings_dropped_nontech": dropped,
+        "postings_dropped_country": stats["dropped_country"],
+        "postings_suppressed_db_full": stats["suppressed"],
+        "db_mb": round(guard.size_mb, 1),
+        "shard": list(shard) if shard else None,
         "postings_closed": closed,
         "postings_deleted_old": deleted_old,
         "postings_pruned": pruned,

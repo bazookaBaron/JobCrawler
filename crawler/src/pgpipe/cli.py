@@ -4,8 +4,16 @@
     jobs purge                   TRUNCATE job_posting + reset crawl_queue (clean re-scrape)
     jobs sync                    data/*.csv -> <schema>.company / job_board
     jobs run [--minutes N]       one bounded crawl pass (default 20): reclaim ->
-                                 enqueue -> crawl (tech-filter + seniority-tag) ->
-                                 close-stale -> hard-delete (RETAIN_DAYS / MAX_POSTING_AGE_DAYS) -> prune
+                 [--shard I/N]   enqueue -> crawl (country gate IN/US, seniority-tag) ->
+                 [--no-cleanup]  close-stale -> hard-delete (RETAIN_DAYS / MAX_POSTING_AGE_DAYS) -> prune.
+                                 --shard crawls only 1/N of the boards (matrix jobs);
+                                 --no-cleanup skips the last three (use `jobs finalize`)
+    jobs finalize                close-stale + hard-delete + prune, once, after all shards
+    jobs import-boards --from-sqlite PATH [--json DIR] [--statuses ok] [--dry-run]
+                                 map another crawler's boards into job_board (origin='autoapply')
+    jobs linkedin [--max-pages N] [--limit-queries N] [--minutes M]
+                                 LinkedIn guest search (signed-out) -> source='linkedin' rows
+    jobs db-size                 pg_database_size + per-table sizes (MAX_DB_MB guard)
     jobs close-stale [--days N]  status='closed' for postings unseen N days (def 1)
     jobs prune [--cap N]         keep newest N postings per company (def 400)
     jobs hard-delete [--days N]  DELETE postings older than N days by first_seen (def 1)
@@ -29,7 +37,7 @@ import sys
 
 from datetime import datetime, timezone
 
-from src.pgpipe import cleanup, csv_sync
+from src.pgpipe import board_import, cleanup, csv_sync, linkedin_source, queue as pg_queue
 from src.pgpipe.config import settings
 from src.pgpipe.db import apply_schema, connect
 from src.pgpipe.posted_at import parse_posted_at
@@ -77,10 +85,13 @@ async def _cmd_sync() -> int:
     return 0
 
 
-async def _cmd_run(minutes: float) -> int:
+async def _cmd_run(minutes: float, shard_raw: str | None, cleanup_after: bool) -> int:
+    shard = pg_queue.parse_shard(shard_raw)
     pool = await connect()
     try:
-        summary = await run_pass(pool, time_budget_seconds=minutes * 60.0)
+        summary = await run_pass(
+            pool, time_budget_seconds=minutes * 60.0, shard=shard, cleanup_after=cleanup_after
+        )
     finally:
         await pool.close()
     _p(summary)
@@ -88,6 +99,73 @@ async def _cmd_run(minutes: float) -> int:
     if summary["boards_attempted"] and summary["boards_ok"] == 0:
         print("ERROR: every board failed this pass", file=sys.stderr)
         return 1
+    return 0
+
+
+async def _cmd_finalize() -> int:
+    """Retention + cap, run once after every crawl shard has finished."""
+    pool = await connect()
+    try:
+        closed = await cleanup.close_stale(pool)
+        deleted = await cleanup.hard_delete_stale(pool)
+        pruned = await cleanup.prune_per_company(pool)
+        purged = await pg_queue.purge_finished(pool)
+    finally:
+        await pool.close()
+    _p({"finalize": "ok", "closed": closed, "deleted_old": deleted, "pruned": pruned,
+        "queue_purged": purged})
+    return 0
+
+
+async def _cmd_import_boards(sqlite_path: str | None, json_dir: str | None,
+                             statuses: str, dry_run: bool) -> int:
+    sources: list[dict] = []
+    if sqlite_path:
+        sources += board_import.load_sqlite(
+            sqlite_path, tuple(x.strip() for x in statuses.split(",") if x.strip())
+        )
+    if json_dir:
+        sources += board_import.load_json_dir(json_dir)
+    mapped, skipped = board_import.map_all(sources)
+    pool = await connect()
+    try:
+        await apply_schema(pool)
+        res = await board_import.import_boards(pool, mapped, dry_run=dry_run)
+    finally:
+        await pool.close()
+    _p({"source_rows": len(sources), "skipped_in_mapping": dict(skipped), **res})
+    return 0
+
+
+async def _cmd_linkedin(max_pages: int, limit_queries: int | None, minutes: float | None,
+                        window_hours: float) -> int:
+    queries = linkedin_source.QUERIES[:limit_queries] if limit_queries else linkedin_source.QUERIES
+    pool = await connect()
+    try:
+        summary = await linkedin_source.run_linkedin(
+            pool, queries=queries, max_pages=max_pages, window_hours=window_hours,
+            time_budget_s=(minutes * 60.0) if minutes else None,
+        )
+    finally:
+        await pool.close()
+    _p(summary)
+    return 0
+
+
+async def _cmd_db_size() -> int:
+    pool = await connect()
+    try:
+        schema = settings.validated_schema()
+        size = await pool.fetchval("SELECT pg_database_size(current_database())")
+        tables = {}
+        for t in ("job_posting", "crawl_queue", "job_board", "company"):
+            tables[t] = {
+                "bytes": await pool.fetchval(f"SELECT pg_total_relation_size('{schema}.{t}')"),
+                "rows": await pool.fetchval(f"SELECT count(*) FROM {schema}.{t}"),
+            }
+    finally:
+        await pool.close()
+    _p({"db_mb": round(size / 1048576, 1), "max_db_mb": settings.max_db_mb, "tables": tables})
     return 0
 
 
@@ -269,6 +347,21 @@ def main() -> None:
     sub.add_parser("sync")
     rp = sub.add_parser("run")
     rp.add_argument("--minutes", type=float, default=20.0)
+    rp.add_argument("--shard", default=None, help="I/N: crawl only shard I of N (0-based)")
+    rp.add_argument("--no-cleanup", action="store_true",
+                    help="skip close-stale / hard-delete / prune (use `jobs finalize`)")
+    sub.add_parser("finalize")
+    ip = sub.add_parser("import-boards")
+    ip.add_argument("--from-sqlite", default=None)
+    ip.add_argument("--json", default=None, help="directory holding companies/top_companies/watchlist.json")
+    ip.add_argument("--statuses", default="ok")
+    ip.add_argument("--dry-run", action="store_true")
+    lp = sub.add_parser("linkedin")
+    lp.add_argument("--max-pages", type=int, default=6)
+    lp.add_argument("--limit-queries", type=int, default=None)
+    lp.add_argument("--minutes", type=float, default=None)
+    lp.add_argument("--window-hours", type=float, default=24.0)
+    sub.add_parser("db-size")
     cp = sub.add_parser("close-stale")
     cp.add_argument("--days", type=int, default=None)
     pp = sub.add_parser("prune")
@@ -287,7 +380,15 @@ def main() -> None:
     elif args.cmd == "sync":
         rc = asyncio.run(_cmd_sync())
     elif args.cmd == "run":
-        rc = asyncio.run(_cmd_run(args.minutes))
+        rc = asyncio.run(_cmd_run(args.minutes, args.shard, not args.no_cleanup))
+    elif args.cmd == "finalize":
+        rc = asyncio.run(_cmd_finalize())
+    elif args.cmd == "import-boards":
+        rc = asyncio.run(_cmd_import_boards(args.from_sqlite, args.json, args.statuses, args.dry_run))
+    elif args.cmd == "linkedin":
+        rc = asyncio.run(_cmd_linkedin(args.max_pages, args.limit_queries, args.minutes, args.window_hours))
+    elif args.cmd == "db-size":
+        rc = asyncio.run(_cmd_db_size())
     elif args.cmd == "close-stale":
         rc = asyncio.run(_cmd_close_stale(args.days))
     elif args.cmd == "prune":

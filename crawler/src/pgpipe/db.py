@@ -14,7 +14,7 @@ async def connect() -> asyncpg.Pool:
     return await asyncpg.create_pool(
         dsn,
         min_size=1,
-        max_size=max(4, settings.concurrency + 2),
+        max_size=settings.pool_max,  # small: 8 matrix shards share the DB's connection cap
         statement_cache_size=0,          # Supabase pooler friendly
         command_timeout=120,
         server_settings={
