@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS report_daily.report (
     -- content: select the columns above when reading the report.
     rollup                 jsonb NOT NULL,     -- additive building blocks for the week
     baseline               jsonb,              -- previous day's compact figures
-    job_state              bytea,              -- zlib(hashed job keys) as of report_date
+    job_state              bytea,              -- zlib(hashed job keys) as of report_date;
+                                               -- NULL when built with --state-dir (Actions cache)
     prev_job_state         bytea               -- same, as of the previous report date
 );
 

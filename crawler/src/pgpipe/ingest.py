@@ -104,13 +104,25 @@ def _to_record(company_slug: str, board_slug: str, source: str, job: DiscoveredJ
     )
 
 
-_UPSERT = """
+# Columns refreshed from the crawl on conflict; a row is only rewritten when one of
+# them changed or last_seen_at is older than settings.touch_min_hours (see config).
+_REFRESH_COLS = (
+    "board_slug", "source", "title", "titles", "location", "locations", "location_type",
+    "employment_type", "department", "date_posted", "seniority", "country",
+    "role_family", "role_category",
+)
+_STALE_SEEN = (
+    f"job_posting.status <> 'open' OR "
+    f"job_posting.last_seen_at < now() - interval '{int(settings.touch_min_hours)} hours'"
+)
+
+_UPSERT = f"""
 INSERT INTO job_posting
     (company_slug, board_slug, source, external_id, url, title, titles,
      location, locations, location_type, employment_type, department, date_posted,
      seniority, country, posted_at, role_family, role_category, first_seen_at, last_seen_at, status)
 VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10,$11,$12,$13,$14,$15,
-        COALESCE($16, now()), $17, $18, now(), now(), 'open')
+        COALESCE($16::timestamptz, now()), $17, $18, now(), now(), 'open')
 ON CONFLICT (company_slug, url) DO UPDATE SET
     board_slug      = EXCLUDED.board_slug,
     source          = EXCLUDED.source,
@@ -129,16 +141,25 @@ ON CONFLICT (company_slug, url) DO UPDATE SET
     role_category   = EXCLUDED.role_category,
     -- A source that stops reporting date_posted on a later crawl shouldn't
     -- blow away a real parsed value we already have.
-    posted_at       = COALESCE(EXCLUDED.posted_at, job_posting.posted_at),
+    -- ($16 itself, not EXCLUDED.posted_at: the insert value falls back to now()
+    -- and would otherwise re-date undated postings to "just posted" every crawl.)
+    posted_at       = COALESCE($16::timestamptz, job_posting.posted_at),
     last_seen_at    = now(),
     status          = 'open'
+WHERE {_STALE_SEEN}
+   OR ({", ".join("job_posting." + c for c in _REFRESH_COLS)})
+      IS DISTINCT FROM ({", ".join("EXCLUDED." + c for c in _REFRESH_COLS)})
+   OR (EXCLUDED.external_id IS NOT NULL
+       AND EXCLUDED.external_id IS DISTINCT FROM job_posting.external_id)
+   OR ($16::timestamptz IS NOT NULL
+       AND $16::timestamptz IS DISTINCT FROM job_posting.posted_at)
 """
 
 
 # DB-full mode: refresh last_seen_at on rows we already hold, insert nothing.
 _TOUCH = (
     "UPDATE job_posting SET last_seen_at = now(), status = 'open' "
-    "WHERE company_slug = $1 AND url = $2"
+    f"WHERE company_slug = $1 AND url = $2 AND ({_STALE_SEEN})"
 )
 
 

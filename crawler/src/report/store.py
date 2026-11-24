@@ -75,6 +75,57 @@ async def read_previous_daily(pool: asyncpg.Pool) -> dict | None:
     return dict(row) if row else None
 
 
+# --- job_state outside the database --------------------------------------------
+# The two job_state blobs (~8 MB each) used to live in report_daily.report and
+# were rewritten every day, which bloated its TOAST table and pulled ~16 MB of
+# egress per run. With a state dir (the market-report workflow keeps it in the
+# GitHub Actions cache) they live in files instead and the DB columns stay NULL.
+# meta.json records which report_date the blobs belong to, so a stale or foreign
+# cache is ignored instead of producing wrong new/removed counts.
+STATE_FILES = ("job_state", "prev_job_state")
+WEEKLY_KEEP_WEEKS = 26
+
+
+def attach_file_state(prev: dict | None, state_dir: Path | None) -> dict | None:
+    """Fill prev['job_state'/'prev_job_state'] from state_dir when the DB copy is
+    empty and the files belong to prev's report_date. DB blobs (pre-migration
+    rows) win, so the first run after the switch still diffs correctly."""
+    if not prev or state_dir is None or prev.get("job_state"):
+        return prev
+    try:
+        meta = json.loads((state_dir / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        log.warning("report.state_files_missing", state_dir=str(state_dir))
+        return prev
+    if meta.get("report_date") != prev["report_date"].isoformat():
+        log.warning(
+            "report.state_files_stale",
+            files_date=meta.get("report_date"),
+            db_date=prev["report_date"].isoformat(),
+        )
+        return prev
+    out = dict(prev)
+    for name in STATE_FILES:
+        p = state_dir / f"{name}.bin"
+        out[name] = p.read_bytes() if p.is_file() and p.stat().st_size else None
+    return out
+
+
+def write_file_state(
+    state_dir: Path, report_date: date, job_state: bytes, prev_job_state: bytes | None
+) -> None:
+    """Write the blobs, then meta.json last, so a half-written dir never matches
+    a report_date."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    meta = state_dir / "meta.json"
+    meta.unlink(missing_ok=True)
+    for name, blob in (("job_state", job_state), ("prev_job_state", prev_job_state)):
+        tmp = state_dir / f"{name}.bin.tmp"
+        tmp.write_bytes(blob or b"")
+        tmp.replace(state_dir / f"{name}.bin")
+    meta.write_text(json.dumps({"report_date": report_date.isoformat()}), encoding="utf-8")
+
+
 def comparison_base(
     prev: dict | None, today: date
 ) -> tuple[state.JobState | None, dict | None, date | None]:
@@ -218,11 +269,15 @@ async def write(
     prev: dict | None,
     base: dict | None,
     quality: dict,
+    state_dir: Path | None = None,
 ) -> dict:
-    """day: build.compute_day() output. Returns a small summary."""
+    """day: build.compute_day() output. Returns a small summary.
+
+    state_dir: keep job_state in files there (DB columns written as NULL)."""
     roll = day["rollup"]
     cmp: state.Comparison = day["comparison"]
     version = code_version()
+    new_blob = state.encode(cmp.new_state)
 
     kpi, sec, _ = sections.build_sections(roll, base)
     async with pool.acquire() as conn, conn.transaction():
@@ -253,6 +308,7 @@ async def write(
             "vs_prev_week_avg": sections.kpi_delta(kpi, week_avg or None),
         }
         same_day = bool(prev and prev["report_date"] == today)
+        carried_blob = (prev or {}).get("prev_job_state" if same_day else "job_state")
         await conn.execute(
             _DAILY_UPSERT,
             today,
@@ -268,8 +324,8 @@ async def write(
             _dump(quality),
             _dump(roll),
             _dump(base) if base else None,
-            state.encode(cmp.new_state),
-            ((prev or {}).get("prev_job_state" if same_day else "job_state")),
+            None if state_dir is not None else new_blob,
+            None if state_dir is not None else carried_blob,
         )
 
         # ---- weekly fold -------------------------------------------------
@@ -365,6 +421,15 @@ async def write(
             "WHERE iso_week < $1 AND status = 'in_progress' RETURNING iso_week",
             iso_week,
         )
+        # Retention: keep the last WEEKLY_KEEP_WEEKS weeks (~1.3 MB per final week).
+        pruned = await conn.fetchval(
+            "WITH d AS (DELETE FROM report_weekly.report WHERE week_start < $1 RETURNING 1) "
+            "SELECT count(*) FROM d",
+            week_start - timedelta(weeks=WEEKLY_KEEP_WEEKS),
+        )
+
+    if state_dir is not None:  # only after the DB transaction committed
+        write_file_state(state_dir, today, new_blob, carried_blob)
 
     return {
         "report_date": today.isoformat(),
@@ -373,6 +438,8 @@ async def write(
         "same_day_rerun": same_day,
         "week_days_covered": len(dates),
         "weeks_finalized": [r["iso_week"] for r in finalized],
+        "weeks_pruned": int(pruned or 0),
+        "job_state_in": "files" if state_dir is not None else "db",
         "kpi": {
             k: kpi.get(k)
             for k in (

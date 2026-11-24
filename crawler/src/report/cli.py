@@ -4,6 +4,7 @@ crawl --shard I --shards N --out DIR   crawl one shard -> DIR/jobs-I.parquet + b
 build --in DIR --shards N              merge shards, write report_daily (1 row)
                                        and fold into report_weekly (1 row/week)
       [--dry-run --out FILE]           compute only, no DB: dump the report JSON
+      [--state-dir DIR]                job_state blobs in DIR, not in the DB row
 migrate                                apply src/report/schema.sql (idempotent)
 show                                   print today's headline + recent weeks
 """
@@ -47,7 +48,14 @@ async def _fx(prev: dict | None) -> tuple[dict, str]:
     )
 
 
-async def _cmd_build(in_dir: Path, shards: int, day: date, dry_run: bool, out: Path | None) -> int:
+async def _cmd_build(
+    in_dir: Path,
+    shards: int,
+    day: date,
+    dry_run: bool,
+    out: Path | None,
+    state_dir: Path | None = None,
+) -> int:
     df, statuses, got = build.load_shards(in_dir)
     if df.height == 0:
         raise SystemExit(f"No jobs found under {in_dir}; refusing to overwrite the report")
@@ -59,6 +67,7 @@ async def _cmd_build(in_dir: Path, shards: int, day: date, dry_run: bool, out: P
         if pool:
             await store.apply_schema(pool)
         prev = await store.read_previous_daily(pool) if pool else None
+        prev = store.attach_file_state(prev, state_dir)
         usd_per, fx_source = await _fx(prev)
         prev_state, base, _ = store.comparison_base(prev, day)
         result = build.compute_day(df, statuses, usd_per, prev_state, base, day)
@@ -111,6 +120,7 @@ async def _cmd_build(in_dir: Path, shards: int, day: date, dry_run: bool, out: P
             prev=prev,
             base=base,
             quality=quality,
+            state_dir=state_dir,
         )
         _p(summary)
     finally:
@@ -164,6 +174,12 @@ def main() -> None:
     )
     b.add_argument("--dry-run", action="store_true")
     b.add_argument("--out", type=Path, default=None)
+    b.add_argument(
+        "--state-dir",
+        type=Path,
+        default=None,
+        help="keep job_state blobs in this dir (Actions cache) instead of the DB row",
+    )
     sub.add_parser("migrate")
     sub.add_parser("show")
     args = ap.parse_args()
@@ -172,7 +188,9 @@ def main() -> None:
         rc = asyncio.run(_cmd_crawl(args.shard, args.shards, args.out))
     elif args.cmd == "build":
         day = args.date or datetime.now(UTC).date()
-        rc = asyncio.run(_cmd_build(args.in_dir, args.shards, day, args.dry_run, args.out))
+        rc = asyncio.run(
+            _cmd_build(args.in_dir, args.shards, day, args.dry_run, args.out, args.state_dir)
+        )
     elif args.cmd == "migrate":
         rc = asyncio.run(_cmd_migrate())
     else:

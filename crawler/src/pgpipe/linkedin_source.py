@@ -193,7 +193,13 @@ async def fetch_page(client: httpx.AsyncClient, state: LinkedInState, params: di
 
 # --- storage -------------------------------------------------------------------
 
-_UPSERT_LI = """
+# Same no-op-rewrite guard as ingest._STALE_SEEN.
+_STALE_SEEN = (
+    f"job_posting.status <> 'open' OR "
+    f"job_posting.last_seen_at < now() - interval '{int(settings.touch_min_hours)} hours'"
+)
+
+_UPSERT_LI = f"""
 WITH incoming AS (
     SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
                          $6::text[], $7::text[], $8::text[], $9::text[], $10::timestamptz[],
@@ -225,6 +231,7 @@ ins AS (
           AND lower(p.title) = lower(i.title) AND p.country IS NOT DISTINCT FROM i.country
     )
     ON CONFLICT (company_slug, url) DO UPDATE SET last_seen_at = now(), status = 'open'
+        WHERE {_STALE_SEEN}   -- skip no-op rewrites (see config.touch_min_hours)
     RETURNING (xmax = 0) AS inserted
 )
 SELECT count(*) FILTER (WHERE inserted) AS inserted,
@@ -235,7 +242,7 @@ FROM ins
 
 _TOUCH_LI = (
     "UPDATE job_posting SET last_seen_at = now(), status = 'open' "
-    "WHERE company_slug = $1 AND url = $2"
+    f"WHERE company_slug = $1 AND url = $2 AND ({_STALE_SEEN})"
 )
 
 

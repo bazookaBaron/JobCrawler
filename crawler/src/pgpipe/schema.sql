@@ -99,15 +99,22 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.job_posting (
 CREATE INDEX IF NOT EXISTS job_posting_company_idx   ON {{SCHEMA}}.job_posting(company_slug);
 CREATE INDEX IF NOT EXISTS job_posting_board_idx     ON {{SCHEMA}}.job_posting(board_slug);
 CREATE INDEX IF NOT EXISTS job_posting_status_idx    ON {{SCHEMA}}.job_posting(status);
-CREATE INDEX IF NOT EXISTS job_posting_last_seen_idx ON {{SCHEMA}}.job_posting(last_seen_at DESC);
+-- No index on last_seen_at: it is bumped on every re-crawl, and an index on it
+-- made every such UPDATE a non-HOT update (new index entries in all ~16 indexes,
+-- 0.04% HOT, 120 MB table for 7k rows). Its only readers are the daily
+-- retention passes, which seq-scan a few thousand rows anyway. fillfactor 80
+-- leaves room on each page so those updates stay HOT (same page, no index writes).
+DROP INDEX IF EXISTS {{SCHEMA}}.job_posting_last_seen_idx;
+ALTER TABLE {{SCHEMA}}.job_posting SET (fillfactor = 80);
 -- Composite (company_slug, first_seen_at) index — also serves the webapp's
 -- "new postings per subscribed company since watermark" notification query
 -- (a simple inequality on first_seen_at uses this fine regardless of the
 -- DESC sort direction), so no separate ASC variant is added.
 CREATE INDEX IF NOT EXISTS job_posting_first_seen_idx
     ON {{SCHEMA}}.job_posting(company_slug, first_seen_at DESC);
-CREATE INDEX IF NOT EXISTS job_posting_ext_idx
-    ON {{SCHEMA}}.job_posting(company_slug, external_id) WHERE external_id IS NOT NULL;
+-- job_posting_ext_idx (company_slug, external_id) was never scanned: nothing
+-- looks postings up by external_id (the upsert key is (company_slug, url)).
+DROP INDEX IF EXISTS {{SCHEMA}}.job_posting_ext_idx;
 
 -- seniority bucket derived from the title at ingest (src/pgpipe/seniority.py):
 -- intern | junior | mid | senior | staff | principal | unknown

@@ -117,6 +117,25 @@ def test_state_roundtrip_and_compare():
     assert sorted(cmp.new_state.keys) == [2, 3, 4]
 
 
+def test_job_state_files_roundtrip_and_stale_guard(tmp_path):
+    from src.report import store
+
+    blob = state.encode(state.compare(None, [1, 2], [10, 10], [None, None], set(), 100).new_state)
+    store.write_file_state(tmp_path, DAY, blob, None)
+    prev = {"report_date": DAY, "job_state": None, "prev_job_state": None}
+    got = store.attach_file_state(prev, tmp_path)
+    assert got["job_state"] == blob and got["prev_job_state"] is None
+    # files from another day are ignored (baseline run, not wrong counts)
+    other = {"report_date": date(2026, 10, 8), "job_state": None, "prev_job_state": None}
+    assert store.attach_file_state(other, tmp_path)["job_state"] is None
+    # a DB blob (pre-migration row) wins over the files
+    legacy = {"report_date": DAY, "job_state": b"db", "prev_job_state": None}
+    assert store.attach_file_state(legacy, tmp_path)["job_state"] == b"db"
+    # no state dir / missing files: unchanged
+    assert store.attach_file_state(prev, None) is prev
+    assert store.attach_file_state(prev, tmp_path / "nope")["job_state"] is None
+
+
 def test_newly_covered_board_is_baseline_not_new():
     # day 1: board 30 failed, so it has no jobs and was never crawled OK
     d1 = state.compare(None, [1, 2], [10, 10], [None, None], {30}, 100, {10})

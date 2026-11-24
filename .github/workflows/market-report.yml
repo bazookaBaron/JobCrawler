@@ -51,10 +51,10 @@ jobs:
       REPORT_BOARD_LIMIT: ${{ inputs.board_limit || '0' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up uv + Python
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
         with:
           python-version: "3.13"
           enable-cache: true
@@ -70,7 +70,7 @@ jobs:
             | tee ../out-summary.json
 
       - name: Upload shard
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: report-shard-${{ matrix.shard }}
           path: out/
@@ -91,10 +91,10 @@ jobs:
       PGPIPE_SCHEMA: crawler
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up uv + Python
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
         with:
           python-version: "3.13"
           enable-cache: true
@@ -103,25 +103,43 @@ jobs:
         run: uv sync --frozen
 
       - name: Download shards
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: report-shard-*
           path: out
           merge-multiple: true
 
+      # Day-over-day job_state (~15 MB of hashed job keys) lives in the Actions
+      # cache, not in report_daily.report (it bloated the DB row and its egress).
+      # Newest cache wins via the prefix; meta.json inside is checked against the
+      # DB's report_date, so a stale/missing cache only costs one baseline day.
+      - name: Restore job_state
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: report-state
+          key: report-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: report-state-
+
       - name: Build report
         run: |
           set -euo pipefail
-          extra=()
+          extra=(--state-dir ../report-state)
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             extra=(--dry-run --out ../report.json)
           fi
           uv run --no-sync python -m src.report.cli build \
             --in ../out --shards "${REPORT_SHARDS}" "${extra[@]}" | tee ../build.json
 
+      - name: Save job_state
+        if: ${{ success() && !inputs.dry_run }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: report-state
+          key: report-state-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: Upload dry-run report
         if: ${{ inputs.dry_run }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: market-report-dry-run
           path: report.json

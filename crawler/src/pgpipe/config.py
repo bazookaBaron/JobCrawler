@@ -87,6 +87,12 @@ class Settings:
     # window (webapp shows status='open' only).
     per_company_cap: int = _int("PGPIPE_PER_COMPANY_CAP", 400)
     close_after_days: int = _int("PGPIPE_CLOSE_AFTER_DAYS", 2)
+    # Write-churn guard: a re-crawled posting whose fields are unchanged only
+    # gets last_seen_at bumped when the stored value is older than this many
+    # hours (or the row is closed). Retention works in days (close 2d, delete
+    # 3d), so 12h loses nothing, and skipping no-op UPDATEs keeps the table
+    # from bloating (every UPDATE writes a whole new row version).
+    touch_min_hours: int = _int("PGPIPE_TOUCH_MIN_HOURS", 12)
     delete_after_days: int = _int("PGPIPE_DELETE_AFTER_DAYS", 1)
     # Fresh-pool retention: a row is deleted once it has not been seen by a
     # crawl for `retain_days` days (closed/removed jobs vanish), or once its
