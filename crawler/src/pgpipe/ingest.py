@@ -15,6 +15,7 @@ from src.pgpipe.config import settings
 from src.pgpipe.country import classify_country
 from src.pgpipe.dbguard import SizeGuard
 from src.pgpipe.monitors_icims import discover_icims
+from src.pgpipe.monitors_workable import discover_workable
 from src.pgpipe.monitors_workday import discover_workday
 from src.pgpipe.posted_at import parse_posted_at
 from src.pgpipe.seniority import seniority_of
@@ -176,6 +177,9 @@ async def _discover(monitor_type: str, board_dict: dict, http: httpx.AsyncClient
     # jobseek's icims monitor is URL-only; use the rich listing parser.
     if monitor_type == "icims":
         return await discover_icims(board_dict, http)
+    # jobseek's workable monitor is URL-only; use the one-call widget API.
+    if monitor_type == "workable":
+        return await discover_workable(board_dict, http)
     return await get_discoverer(monitor_type)(board_dict, http)
 
 
