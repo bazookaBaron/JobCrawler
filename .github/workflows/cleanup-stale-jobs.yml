@@ -48,7 +48,14 @@ jobs:
           set -euo pipefail
           uv run --no-sync jobs snapshot-market | tee ../snapshot.json
 
-      - name: Hard-delete rows unseen for ${{ env.RETAIN_DAYS }}d or posted >${{ env.MAX_POSTING_AGE_DAYS }}d ago
+      - name: Crawl health gate (need a crawl_run in the last 24h with boards_ok > 0)
+        id: health
+        run: |
+          if uv run --no-sync jobs crawl-health; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "ok=false" >> "$GITHUB_OUTPUT"; echo "::warning::no healthy crawl in 24h - skipping hard-deletes"; fi
+
+      - name: Hard-delete rows unseen for ${{ env.RETAIN_DAYS }}d or over ${{ env.MAX_POSTING_AGE_DAYS }}d old
+        if: steps.health.outputs.ok == 'true'
         run: |
           set -euo pipefail
           uv run --no-sync jobs hard-delete --days "${RETAIN_DAYS}" | tee ../delete.json

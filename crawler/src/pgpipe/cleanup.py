@@ -6,17 +6,49 @@ import asyncpg
 from src.pgpipe.config import settings
 
 
+# A row may only be aged out by "not seen" when we have positive evidence the
+# board was crawled successfully AFTER the row was last seen (otherwise a failed
+# / skipped crawl would look like "the job vanished"). Disabled boards (gone, or
+# removed from the CSV) and board-less rows (LinkedIn search) can never produce
+# that evidence, so they fall back to the plain time rule.
+_BOARD_OK = """NOT EXISTS (
+    SELECT 1 FROM job_board b
+    WHERE b.board_slug = p.board_slug
+      AND b.is_enabled
+      AND NOT (COALESCE(b.last_success_at > p.last_seen_at, false)
+               AND b.consecutive_failures = 0)
+)"""
+
+
+async def crawl_healthy(pool: asyncpg.Pool, hours: int = 24) -> bool:
+    """True when at least one crawl_run finished in the last `hours` with
+    boards_ok > 0. Guards destructive deletes: if the crawler has been down (or
+    every board failed), 'not seen recently' says nothing about the jobs."""
+    ok = await pool.fetchval(
+        f"""
+        SELECT EXISTS (
+            SELECT 1 FROM crawl_run
+            WHERE COALESCE(finished_at, started_at) > now() - interval '{int(hours)} hours'
+              AND COALESCE(boards_ok, 0) > 0
+        )
+        """
+    )
+    return bool(ok)
+
+
 async def close_stale(pool: asyncpg.Pool, days: int | None = None) -> int:
-    """Mark postings not seen in `days` as status='closed'. Run at end of each run."""
+    """Mark postings not seen in `days` as status='closed' - only rows whose
+    board has had a successful crawl since the row was last seen. Run at end of each run."""
     d = int(days if days is not None else settings.close_after_days)
     async with pool.acquire() as conn:
         n = await conn.fetchval(
             f"""
             WITH upd AS (
-                UPDATE job_posting
+                UPDATE job_posting p
                 SET status = 'closed'
-                WHERE status <> 'closed'
-                  AND last_seen_at < now() - interval '{d} days'
+                WHERE p.status <> 'closed'
+                  AND p.last_seen_at < now() - interval '{d} days'
+                  AND {_BOARD_OK}
                 RETURNING 1
             )
             SELECT count(*) FROM upd
@@ -50,20 +82,31 @@ async def prune_per_company(pool: asyncpg.Pool, cap: int | None = None) -> int:
     return int(n or 0)
 
 
-async def hard_delete_stale(pool: asyncpg.Pool, days: int | None = None) -> int:
+async def hard_delete_stale(pool: asyncpg.Pool, days: int | None = None, *, force: bool = False) -> int:
     """DELETE rows not seen by a crawl in `days` days (RETAIN_DAYS, default 3)
-    OR whose real posting date (posted_at) is older than MAX_POSTING_AGE_DAYS
-    (default 30). A still-open job is re-seen daily (last_seen_at = now()) and
-    stays; closed/removed jobs vanish within `days` days."""
+    OR older than MAX_POSTING_AGE_DAYS (default 15). A still-open job is re-seen
+    daily (last_seen_at = now()) and stays.
+
+    - The "not seen" rule only applies to rows whose board crawled successfully
+      after the row's last_seen_at (see _BOARD_OK).
+    - The age cap uses the real posted_at for dated postings and first_seen_at
+      for undated ones (their posted_at is a synthetic "first crawl" time).
+    - Nothing is deleted unless a crawl_run in the last 24h had boards_ok > 0
+      (skip with force=True); returns 0 in that case."""
     d = int(days if days is not None else settings.retain_days)
     m = int(settings.max_posting_age_days)
+    if not force and not await crawl_healthy(pool):
+        return 0
     async with pool.acquire() as conn:
         n = await conn.fetchval(
             f"""
             WITH del AS (
-                DELETE FROM job_posting
-                WHERE last_seen_at < now() - interval '{d} days'
-                   OR posted_at < now() - interval '{m} days'
+                DELETE FROM job_posting p
+                WHERE (p.last_seen_at < now() - interval '{d} days' AND {_BOARD_OK})
+                   OR (COALESCE(btrim(p.date_posted), '') <> ''
+                       AND p.posted_at < now() - interval '{m} days')
+                   OR (COALESCE(btrim(p.date_posted), '') = ''
+                       AND p.first_seen_at < now() - interval '{m} days')
                 RETURNING 1
             )
             SELECT count(*) FROM del
@@ -208,7 +251,7 @@ class MixGate:
                     bound[key] = "all"
                 else:
                     bound[key] = await self._pool.fetchval(
-                        f"SELECT posted_at FROM job_posting WHERE {cond} "
+                        f"SELECT posted_at FROM job_posting WHERE status = 'open' AND {cond} "
                         "ORDER BY posted_at DESC NULLS LAST, first_seen_at DESC, id DESC OFFSET $1 LIMIT 1",
                         cap - 1,
                     )

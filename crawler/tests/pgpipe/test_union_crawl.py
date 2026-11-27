@@ -140,7 +140,9 @@ def test_icims_location_and_host():
 def test_relative_posted_at(raw, days):
     got = parse_posted_at(raw)
     assert got is not None
-    assert abs((datetime.now(timezone.utc) - got) - timedelta(days=days)) < timedelta(minutes=1)
+    # truncated to midnight UTC so repeated crawls produce the same value
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    assert got == today - timedelta(days=days)
 
 
 def test_iso_posted_at_unchanged():
@@ -292,7 +294,7 @@ async def test_workday_retries_429_and_stops_on_old_pages(monkeypatch):
 
     monkeypatch.setattr(wd, "_RETRY_WAITS", (0.0, 0.0, 0.0))
     from types import SimpleNamespace
-    monkeypatch.setattr(wd, "settings", SimpleNamespace(workday_gap_seconds=0.0, workday_max_pages=50))
+    monkeypatch.setattr(wd, "settings", SimpleNamespace(workday_gap_seconds=0.0, workday_max_pages=50, max_posting_age_days=15))
     calls = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -302,8 +304,8 @@ async def test_workday_retries_429_and_stops_on_old_pages(monkeypatch):
         offset = json.loads(request.content)["offset"]
         if offset == 0:
             return httpx.Response(200, json={"total": 100, "jobPostings": [_wd_posting(i, "Posted Today") for i in range(20)]})
-        # second page is entirely "30+ days ago" -> crawl must stop, never ask for offset 40
-        return httpx.Response(200, json={"total": 100, "jobPostings": [_wd_posting(100 + i, "Posted 30+ Days Ago") for i in range(20)]})
+        # second page is entirely past the 15-day window -> crawl must stop, never ask for offset 40
+        return httpx.Response(200, json={"total": 100, "jobPostings": [_wd_posting(100 + i, "Posted 16 Days Ago") for i in range(20)]})
 
     board = {"board_url": "https://acme.wd5.myworkdayjobs.com/Careers", "metadata": {}, "board_slug": "x"}
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -311,4 +313,4 @@ async def test_workday_retries_429_and_stops_on_old_pages(monkeypatch):
     assert calls["n"] == 3                      # 429 retry + page 0 + page 1, then stop
     assert len(jobs) == 40
     assert jobs[0].url == "https://acme.wd5.myworkdayjobs.com/Careers/job/Loc/Role-0_R0"
-    assert parse_posted_at(jobs[-1].date_posted) < datetime.now(timezone.utc) - timedelta(days=30)
+    assert parse_posted_at(jobs[-1].date_posted) < datetime.now(timezone.utc) - timedelta(days=15)

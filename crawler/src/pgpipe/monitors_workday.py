@@ -27,7 +27,20 @@ log = structlog.get_logger()
 _PAGE = 20
 _MAX_POSTINGS = 2000
 _MAX_PAGES = _MAX_POSTINGS // _PAGE
-_OLD_RE = re.compile(r"\d+\+\s*days?\s+ago", re.I)  # "Posted 30+ Days Ago"
+_AGE_RE = re.compile(r"(\d+)\+?\s*days?\s+ago", re.I)  # "Posted 3 Days Ago", "Posted 30+ Days Ago"
+
+
+def _age_days(posted_on: str | None) -> int | None:
+    """Whole days since posting from Workday's relative text (None if unknown)."""
+    t = (posted_on or "").strip().lower()
+    if not t:
+        return None
+    if "today" in t or "just" in t:
+        return 0
+    if "yesterday" in t:
+        return 1
+    m = _AGE_RE.search(t)
+    return int(m.group(1)) if m else None
 
 # https://{tenant}.{dc}.myworkdayjobs.com/[locale/]{site}[/...]
 _URL_RE = re.compile(
@@ -170,9 +183,12 @@ async def discover_workday(board: dict, client: httpx.AsyncClient) -> list[Disco
             if job and job.url not in seen:
                 seen.add(job.url)
                 out.append(job)
-        # Results come newest-first: once a whole page is "30+ days ago" the
-        # rest is outside the posting window, so stop paging.
-        if all(_OLD_RE.search(p.get("postedOn") or "") for p in postings):
+        # Results come newest-first: once a whole page is at/over the posting
+        # window (MAX_POSTING_AGE_DAYS, default 15) the rest is outside it too
+        # (ingest drops those anyway), so stop paging.
+        window = int(settings.max_posting_age_days)
+        ages = [_age_days(p.get("postedOn")) for p in postings]
+        if all(a is not None and a >= window for a in ages):
             break
         if len(postings) < _PAGE:
             break

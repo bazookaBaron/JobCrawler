@@ -24,6 +24,14 @@ ALTER TABLE {{SCHEMA}}.company
     ADD COLUMN IF NOT EXISTS company_type text NOT NULL DEFAULT 'unknown'
     CHECK (company_type IN ('product', 'startup', 'service', 'unknown'));
 
+-- Logo / domain for the webapp (company logos). logo_url / icon_url come from
+-- data/companies.csv (csv_sync); domain is derived from website (csv_sync) or the
+-- board's custom host (board_import). Idempotent ALTERs: `jobs migrate` is the
+-- migration mechanism for this schema, so existing databases pick these up.
+ALTER TABLE {{SCHEMA}}.company ADD COLUMN IF NOT EXISTS logo_url text;
+ALTER TABLE {{SCHEMA}}.company ADD COLUMN IF NOT EXISTS icon_url text;
+ALTER TABLE {{SCHEMA}}.company ADD COLUMN IF NOT EXISTS domain   text;
+
 -- --- boards (from data/boards.csv) --------------------------------------
 CREATE TABLE IF NOT EXISTS {{SCHEMA}}.job_board (
     board_slug            text PRIMARY KEY,

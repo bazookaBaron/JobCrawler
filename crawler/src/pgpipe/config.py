@@ -65,6 +65,9 @@ class Settings:
     # Per-board fetch timeout and attempt cap.
     board_timeout_seconds: float = _float("PGPIPE_BOARD_TIMEOUT", 90.0)
     max_attempts: int = _int("PGPIPE_MAX_ATTEMPTS", 3)
+    # Workday boards page sequentially (20/page) behind a global 1s+ gate with
+    # 429 back-off, so one board legitimately takes minutes: own, larger budget.
+    workday_board_timeout_seconds: float = _float("PGPIPE_WORKDAY_BOARD_TIMEOUT", 600.0)
 
     # Reset 'claimed' queue rows older than this at the start of each run.
     reclaim_after_minutes: int = _int("PGPIPE_RECLAIM_AFTER_MIN", 30)
@@ -139,6 +142,11 @@ class Settings:
     icims_max_pages: int = _int("PGPIPE_ICIMS_MAX_PAGES", 25)
 
     worker_id: str = os.environ.get("PGPIPE_WORKER_ID", "").strip() or f"gha-{os.getpid()}"
+
+    def board_timeout_for(self, monitor_type: str | None) -> float:
+        if monitor_type == "workday":
+            return max(self.board_timeout_seconds, self.workday_board_timeout_seconds)
+        return self.board_timeout_seconds
 
     def validated_schema(self) -> str:
         if not _IDENT_RE.match(self.schema):

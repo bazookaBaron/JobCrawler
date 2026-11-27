@@ -80,6 +80,25 @@ def _company_from_host(host: str, ats: str) -> str:
     return slugify(core[-1] if core else labels[0])
 
 
+_ATS_HOSTS = ("greenhouse.io", "ashbyhq.com", "lever.co", "myworkdayjobs.com", "icims.com")
+
+
+def custom_domain(board_url: str, ats: str) -> str | None:
+    """Company domain, only when the board lives on the company's own host
+    (successfactors feeds on a custom domain). ATS-hosted boards (greenhouse,
+    ashby, lever, workday, icims, jobs2web/sapsf) say nothing about the company's
+    domain, so they return None. Leading generic labels (careers., jobs., ...) are dropped."""
+    host = (urlparse(board_url or "").hostname or "").lower().strip(".")
+    if not host or ats != "successfactors":
+        return None
+    if any(host == h or host.endswith("." + h) for h in _ATS_HOSTS + _SF_HOSTING):
+        return None
+    labels = host.split(".")
+    while len(labels) > 2 and labels[0] in _SF_GENERIC_SUBS | {"www"}:
+        labels.pop(0)
+    return ".".join(labels) if len(labels) >= 2 else None
+
+
 def map_board(ats: str, board_id: str, company: str | None = None) -> dict | None:
     """AutoApply (ats, board_id[, company]) -> job_board row dict, or None when
     the ATS is unsupported / the id is unusable. Keys: identity, board_slug,
@@ -141,6 +160,7 @@ def map_board(ats: str, board_id: str, company: str | None = None) -> dict | Non
         "board_slug": board_slug,
         "company_slug": company_slug,
         "company_name": (company or "").strip() or _titleize(company_slug),
+        "company_domain": custom_domain(url, ats),
         "board_url": url,
         "monitor_type": monitor_type,
         "monitor_config": cfg,
@@ -255,9 +275,11 @@ async def import_boards(pool: asyncpg.Pool, mapped: list[dict], dry_run: bool = 
         if not dry_run and todo:
             async with conn.transaction():
                 await conn.executemany(
-                    "INSERT INTO company (slug, name, updated_at) VALUES ($1, $2, now()) "
-                    "ON CONFLICT (slug) DO NOTHING",
-                    list({m["company_slug"]: (m["company_slug"], m["company_name"]) for m in todo}.values()),
+                    "INSERT INTO company (slug, name, domain, updated_at) VALUES ($1, $2, $3, now()) "
+                    "ON CONFLICT (slug) DO UPDATE SET domain = EXCLUDED.domain "
+                    "WHERE company.domain IS NULL AND EXCLUDED.domain IS NOT NULL",
+                    list({m["company_slug"]: (m["company_slug"], m["company_name"], m.get("company_domain"))
+                          for m in todo}.values()),
                 )
                 await conn.executemany(
                     "INSERT INTO job_board (board_slug, company_slug, board_url, monitor_type, "

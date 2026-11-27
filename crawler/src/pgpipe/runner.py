@@ -40,7 +40,8 @@ async def _worker(
         try:
             async with pol.slot(row["board_url"]):
                 res = await asyncio.wait_for(
-                    crawl_board(pool, row, http, guard, mix), timeout=settings.board_timeout_seconds
+                    crawl_board(pool, row, http, guard, mix),
+                    timeout=settings.board_timeout_for(row["monitor_type"]),
                 )
             await with_retry(lambda: queue.finish_ok(pool, qid), what=f"{name}-finish")
             stats["ok"] += 1
@@ -104,7 +105,7 @@ async def run(
     closed = deleted_old = pruned = 0
     if cleanup_after:
         closed = await cleanup.close_stale(pool)
-        deleted_old = await cleanup.hard_delete_stale(pool)  # not seen in RETAIN_DAYS or posted > MAX_POSTING_AGE_DAYS ago
+        deleted_old = await cleanup.hard_delete_stale(pool, force=stats["ok"] > 0)  # not seen in RETAIN_DAYS or posted > MAX_POSTING_AGE_DAYS ago
         pruned = await cleanup.prune_per_company(pool)
 
     kept = stats["upserted"]

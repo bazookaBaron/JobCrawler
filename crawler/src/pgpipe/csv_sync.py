@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import json
+from urllib.parse import urlparse
 
 import asyncpg
 
@@ -33,6 +34,27 @@ def _parse_config(raw: str | None) -> str:
         return "{}"
 
 
+def domain_of(website: str | None) -> str | None:
+    """'https://www.Example.com/path' -> 'example.com' (None when not derivable)."""
+    raw = (website or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        host = (urlparse(raw).hostname or "").lower().strip(".")
+    except ValueError:
+        return None
+    if host.startswith("www."):
+        host = host[4:]
+    return host if "." in host else None
+
+
+def _opt(v: str | None) -> str | None:
+    v = (v or "").strip()
+    return v or None
+
+
 _COMPANY_TYPES = {"product", "startup", "service", "unknown"}
 
 
@@ -48,13 +70,17 @@ async def sync(pool: asyncpg.Pool) -> dict[str, int]:
     async with pool.acquire() as conn, conn.transaction():
         await conn.executemany(
             """
-            INSERT INTO company (slug, name, website, industry, company_type, updated_at)
-            VALUES ($1, $2, $3, $4, $5, now())
+            INSERT INTO company (slug, name, website, industry, company_type,
+                                 logo_url, icon_url, domain, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
             ON CONFLICT (slug) DO UPDATE SET
                 name = EXCLUDED.name,
                 website = EXCLUDED.website,
                 industry = EXCLUDED.industry,
                 company_type = EXCLUDED.company_type,
+                logo_url = EXCLUDED.logo_url,
+                icon_url = EXCLUDED.icon_url,
+                domain = COALESCE(EXCLUDED.domain, company.domain),
                 updated_at = now()
             """,
             [
@@ -64,6 +90,9 @@ async def sync(pool: asyncpg.Pool) -> dict[str, int]:
                     (c.get("website") or None),
                     int(c["industry"]) if (c.get("industry") or "").strip().isdigit() else None,
                     _company_type(c.get("company_type")),
+                    _opt(c.get("logo_url")),
+                    _opt(c.get("icon_url")),
+                    domain_of(c.get("website")),
                 )
                 for c in companies
             ],

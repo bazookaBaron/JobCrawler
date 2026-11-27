@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import asyncpg
 import httpx
@@ -77,8 +78,16 @@ def _rows_from_result(result: object) -> list[DiscoveredJob]:
     return []
 
 
+def _is_http_url(url: str | None) -> bool:
+    """Only absolute http(s) URLs are stored (the webapp renders them as apply links)."""
+    if not url:
+        return False
+    u = urlparse(url.strip())
+    return u.scheme.lower() in ("http", "https") and bool(u.netloc)
+
+
 def _to_record(company_slug: str, board_slug: str, source: str, job: DiscoveredJob) -> tuple | None:
-    if not job.url:
+    if not _is_http_url(job.url):
         return None
     titles = _titles(job)
     locations = job.locations or []

@@ -16,7 +16,7 @@ A trimmed, **$0-budget** job-posting crawler, adapted from the crawler of
   a compact CXS-API monitor). No browser, no scrapers, **no descriptions stored**.
 - **All roles, India + US only** — the title filter is now OFF by default
   (`PGPIPE_TECH_ONLY=1` restores engineering-only); postings are kept only when
-  classified IN/US (`PGPIPE_COUNTRIES`), up to 30 days old. The daily crawl covers
+  classified IN/US (`PGPIPE_COUNTRIES`), up to 15 days old (`MAX_POSTING_AGE_DAYS`). The daily crawl covers
   the union of this repo's boards, ~14.5k imported AutoApply boards
   (greenhouse/ashby/lever/workday/icims/successfactors, `jobs import-boards`) and
   LinkedIn guest search (`jobs linkedin`), sharded 8-way in Actions. A DB size
@@ -43,8 +43,8 @@ job-crawler/
 │   ├── data/boards.csv        ~516 rich-monitor boards (trimmed)
 │   └── pyproject.toml         + `jobs = "src.pgpipe.cli:main"`
 ├── .github/workflows/
-│   ├── crawl-jobs.yml         cron every 6h: migrate -> sync -> run (+close+prune)
-│   ├── cleanup-stale-jobs.yml cron daily: hard-delete postings unseen 5d
+│   ├── crawl-jobs.yml         cron daily 13:00 IST: migrate -> sync -> crawl x8 shards + linkedin -> finalize (close 2d, delete 3d, prune)
+│   ├── cleanup-stale-jobs.yml cron daily: snapshot, then hard-delete postings unseen 3d (board-verified) / over 15d; skipped without a healthy crawl in 24h
 │   └── market-report.yml      cron daily: market report -> report_daily / report_weekly
 ├── search/jobs_search.sql     FTS functions on crawler.job_posting
 ├── search/jobs_search.js      node-postgres / supabase-js wrappers
@@ -190,7 +190,7 @@ This repo has **no git remote** yet. To run it on GitHub Actions:
    `?sslmode=require`). That is the only secret. **No `REDIS_URL`.**
 3. Actions tab → run **crawl-jobs** once via *Run workflow*, then
    **cleanup-stale-jobs** once. After that both run on cron
-   (crawl every 6 h, cleanup daily 04:17 UTC).
+   (crawl daily 07:30 UTC, cleanup daily 07:00 UTC).
 4. Apply search helpers once: `psql "$LOCAL_DATABASE_URL" -f search/jobs_search.sql`.
 
 See `UPSTREAM_DRIFT.md` for exactly what changed vs jobseek and how to pull a

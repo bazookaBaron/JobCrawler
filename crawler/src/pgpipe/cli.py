@@ -8,7 +8,7 @@
                  [--no-cleanup]  close-stale -> hard-delete (RETAIN_DAYS / MAX_POSTING_AGE_DAYS) -> prune.
                                  --shard crawls only 1/N of the boards (matrix jobs);
                                  --no-cleanup skips the last three (use `jobs finalize`)
-    jobs finalize                close-stale + hard-delete + prune, once, after all shards
+    jobs finalize                close-stale + hard-delete (guarded) + prune, once, after all shards
     jobs import-boards --from-sqlite PATH [--json DIR] [--statuses ok] [--dry-run]
                                  map another crawler's boards into job_board (origin='autoapply')
     jobs linkedin [--max-pages N] [--limit-queries N] [--minutes M]
@@ -16,7 +16,9 @@
     jobs db-size                 pg_database_size + per-table sizes (MAX_DB_MB guard)
     jobs close-stale [--days N]  status='closed' for postings unseen N days (def 1)
     jobs prune [--cap N]         keep newest N postings per company (def 400)
-    jobs hard-delete [--days N]  DELETE postings older than N days by first_seen (def 1)
+    jobs hard-delete [--days N]  DELETE postings unseen N days (def RETAIN_DAYS=3) or past the age cap;
+                                  no-op unless a crawl_run in the last 24h had boards_ok > 0
+    jobs crawl-health            exit 0 if a crawl_run in the last 24h had boards_ok > 0, else 1
     jobs reclassify [--all] [--enforce] [--dry-run]   role_family backfill + apply pool rules
     jobs snapshot-market         compute crawler.compute_market_snapshot() and
                                   upsert it into public.jobs_market_snapshot_daily
@@ -110,6 +112,7 @@ async def _cmd_finalize() -> int:
     pool = await connect()
     try:
         closed = await cleanup.close_stale(pool)
+        healthy = await cleanup.crawl_healthy(pool)            # no healthy crawl in 24h -> no hard-delete
         deleted = await cleanup.hard_delete_stale(pool)
         pruned = await cleanup.prune_per_company(pool)
         reclassified = await cleanup.reclassify(pool)          # legacy rows without role_family
@@ -117,7 +120,8 @@ async def _cmd_finalize() -> int:
         purged = await pg_queue.purge_finished(pool)
     finally:
         await pool.close()
-    _p({"finalize": "ok", "closed": closed, "deleted_old": deleted, "pruned": pruned,
+    _p({"finalize": "ok", "closed": closed, "deleted_old": deleted,
+        "hard_delete_skipped": not healthy, "pruned": pruned,
         "reclassified": reclassified, "mix": mix, "queue_purged": purged})
     return 0
 
@@ -216,11 +220,23 @@ async def _cmd_prune(cap: int | None) -> int:
 async def _cmd_hard_delete(days: int | None) -> int:
     pool = await connect()
     try:
+        healthy = await cleanup.crawl_healthy(pool)
         n = await cleanup.hard_delete_stale(pool, days)
     finally:
         await pool.close()
-    _p({"hard_deleted": n, "days": days or settings.retain_days})
+    _p({"hard_deleted": n, "days": days or settings.retain_days, "skipped_no_healthy_crawl": not healthy})
     return 0
+
+
+async def _cmd_crawl_health() -> int:
+    """Exit 0 when a crawl_run in the last 24h had boards_ok > 0, else 1 (CI gate for deletes)."""
+    pool = await connect()
+    try:
+        healthy = await cleanup.crawl_healthy(pool)
+    finally:
+        await pool.close()
+    _p({"crawl_healthy_24h": healthy})
+    return 0 if healthy else 1
 
 
 _BREAKDOWN_SQL = r"""
@@ -384,6 +400,7 @@ def main() -> None:
     rc_p.add_argument("--all", action="store_true", help="re-classify every row, not only NULL role_family")
     rc_p.add_argument("--enforce", action="store_true", help="also drop other-role / non IN-US rows and trim caps")
     rc_p.add_argument("--dry-run", action="store_true", help="with --enforce: count only, change nothing")
+    sub.add_parser("crawl-health")
     sub.add_parser("snapshot-market")
     sub.add_parser("backfill-posted-at")
     sub.add_parser("stats")
@@ -413,6 +430,8 @@ def main() -> None:
         rc = asyncio.run(_cmd_hard_delete(args.days))
     elif args.cmd == "reclassify":
         rc = asyncio.run(_cmd_reclassify(args.all, args.enforce, args.dry_run))
+    elif args.cmd == "crawl-health":
+        rc = asyncio.run(_cmd_crawl_health())
     elif args.cmd == "snapshot-market":
         rc = asyncio.run(_cmd_snapshot_market())
     elif args.cmd == "backfill-posted-at":

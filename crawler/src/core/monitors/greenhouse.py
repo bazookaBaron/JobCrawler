@@ -210,7 +210,9 @@ async def discover(board: dict, client: httpx.AsyncClient, pw=None) -> list[Disc
         )
 
     url = _api_url(token)
-    response = await client.get(url, params={"content": "true"})
+    # content=false: the pgpipe pipeline stores no descriptions, and content=true
+    # multiplies the payload (full HTML bodies) for every board.
+    response = await client.get(url, params={"content": "false"})
     if response.status_code == 404:
         # Greenhouse returns 404 when the board token has been deleted
         # upstream — i.e. the company removed the board. Surface this

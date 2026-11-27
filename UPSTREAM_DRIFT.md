@@ -65,7 +65,7 @@ is bypassed by a new single-process package, **`src/pgpipe/`**.
   ~2-4 YoE, and the analytics tab needs a usable "mid" bucket. Non-IC
   ambiguous titles still fall to `unknown`. Effect on the live tech-only set:
   `mid` 1.6 % → **26.3 %**, `unknown` 41.6 % → **15.8 %**.
-  Re-tagged on every upsert, so a `jobs run` (or the 6 h cron) after this
+  Re-tagged on every upsert, so a `jobs run` (or the daily cron) after this
   change updates existing rows' `seniority`.
 - **Workday** — `src/pgpipe/monitors_workday.py`. jobseek's
   `src/core/monitors/workday.py` is URL-only (needs a scraper); this hits the
@@ -150,9 +150,9 @@ Other new tables: `crawler.company`, `crawler.job_board`, `crawler.crawl_queue`,
 
 | when | action | where |
 |---|---|---|
-| end of every `jobs run` | `UPDATE … SET status='closed' WHERE last_seen_at < now() - interval '3 days' AND status <> 'closed'` | `cleanup.close_stale` |
+| end of every `jobs run` | `UPDATE … SET status='closed' WHERE last_seen_at < now() - interval '2 days' AND status <> 'closed'` (only rows whose board crawled OK since last seen) | `cleanup.close_stale` |
 | end of every `jobs run` | keep newest **400** per company: `DELETE … WHERE id IN (SELECT id FROM (… row_number() OVER (PARTITION BY company_slug ORDER BY first_seen_at DESC)) WHERE rn > 400)` | `cleanup.prune_per_company` |
-| daily workflow `cleanup-stale-jobs.yml` | `DELETE FROM crawler.job_posting WHERE last_seen_at < now() - interval '5 days'` + a prune pass | `cleanup.hard_delete_stale` |
+| daily workflow `cleanup-stale-jobs.yml` | `DELETE FROM crawler.job_posting WHERE last_seen_at < now() - interval '3 days'` (board-verified) or past the 15-day age cap; skipped unless a crawl_run in 24h had boards_ok > 0 + a prune pass | `cleanup.hard_delete_stale` |
 
 Thresholds overridable: `PGPIPE_CLOSE_AFTER_DAYS`, `PGPIPE_PER_COMPANY_CAP`,
 `PGPIPE_DELETE_AFTER_DAYS`.

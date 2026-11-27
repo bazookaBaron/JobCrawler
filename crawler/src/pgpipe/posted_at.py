@@ -27,7 +27,18 @@ _UNIT = {"minute": timedelta(minutes=1), "hour": timedelta(hours=1), "day": time
          "week": timedelta(weeks=1), "month": timedelta(days=30)}
 
 
+def _day(dt: datetime) -> datetime:
+    """Truncate to midnight UTC so repeated crawls in a day produce the same value
+    (the ingest upsert only rewrites a row when posted_at differs)."""
+    return dt.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 def _parse_relative(raw: str, now: datetime) -> datetime | None:
+    d = _parse_relative_raw(raw, now)
+    return _day(d) if d is not None else None
+
+
+def _parse_relative_raw(raw: str, now: datetime) -> datetime | None:
     t = raw.strip().lower()
     if re.fullmatch(r"(posted\s+)?(today|just now|just posted)", t):
         return now
